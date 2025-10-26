@@ -477,8 +477,26 @@ st.subheader("Filters")
 fc1, fc2, fc3, fc4 = st.columns(4)
 sc_min, sc_max = fc1.slider("Smart Score", 0, 100, (70, 100))
 safety_cut = fc2.slider("Min Safety", 0, 100, 70)
-make_sel = fc3.multiselect("Make", sorted(list(data["Make"].dropna().unique())))
+make_sel = fc3.multiselect("Make", sorted(list(data["Make"].dropna().unique())) if "Make" in data.columns else [])
 val_sel = fc4.multiselect("Value Category", ["Under Market","At Market","Over Market"])
+
+# Defensive defaults
+score_col = "Score" if "Score" in data.columns else None
+safety_col = "SafetyScore" if "SafetyScore" in data.columns else None
+
+mask = pd.Series(True, index=data.index)
+if score_col:
+    mask &= data[score_col].between(sc_min, sc_max)
+if safety_col:
+    mask &= data[safety_col] >= safety_cut
+if make_sel and "Make" in data.columns:
+    mask &= data["Make"].isin(make_sel)
+if val_sel and "ValueCategory" in data.columns:
+    mask &= data["ValueCategory"].isin(val_sel)
+
+filtered = data.loc[mask].copy()
+
+st.write("DEBUG — data columns:", list(data.columns))
 
 mask = (data["Score"].between(sc_min, sc_max)) & (data["SafetyScore"]>=safety_cut)
 if make_sel: mask &= data["Make"].isin(make_sel)
