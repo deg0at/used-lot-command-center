@@ -1,58 +1,69 @@
 # ==============================================================
-# Used Lot Command Center — AI Edition (v5)
-# Stateful: persists processed data across reruns via session_state
-# Adds: "Use last inventory" + "Use existing Carfax cache" checkboxes
+# Used Lot Command Center — AI Edition (v6)
+# Persistent folders, cache-first parsing, AI query (fixed), view toggle
 # ==============================================================
 
-import io, re, zipfile, json, os, traceback
+import io, os, re, json, zipfile, traceback
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-from datetime import datetime
 from pypdf import PdfReader
 
-# ---------- Local modules ----------
+# Local modules
 from modules.carfax_cache import load_cache, get_cached, upsert_cache
 from modules.ai_query import interpret_query
 
-# ---------- Optional OpenAI ----------
+# Optional OpenAI (used inside modules.ai_query if key set)
 try:
-    from openai import OpenAI
-    OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
-    openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    from openai import OpenAI  # noqa: F401
 except Exception:
-    OPENAI_API_KEY = None
-    openai_client = None
+    pass
 
-# ---------- Config ----------
+# ------------------ App Config ------------------
 st.set_page_config(page_title="Used Lot Command Center — AI", layout="wide")
 st.title("🚗 Used Lot Command Center — AI Edition")
 
-# ---------- Helpers ----------
+DATA_DIR = "data"
+CARFAX_DIR = os.path.join(DATA_DIR, "carfaxes")
+LISTINGS_DIR = os.path.join(DATA_DIR, "listings")
+os.makedirs(CARFAX_DIR, exist_ok=True)
+os.makedirs(LISTINGS_DIR, exist_ok=True)
+
 VIN_RE = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
 
+# ------------------ Helpers ------------------
 def to_num(x):
     try:
         return float(str(x).replace("$","").replace(",","").strip())
-    except:
+    except Exception:
         return None
 
 def to_excel_bytes(df: pd.DataFrame) -> io.BytesIO:
     bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
+    with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+        df.to_excel(xw, index=False)
     bio.seek(0)
     return bio
+
+def latest_file_in(dirpath: str):
+    files = [os.path.join(dirpath, f) for f in os.listdir(dirpath) if os.path.isfile(os.path.join(dirpath, f))]
+    if not files:
+        return None
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files[0]
 
 def extract_pdf_lines(file_like):
     reader = PdfReader(file_like)
     lines = []
-    for page in reader.pages:
-        txt = page.extract_text() or ""
+    for pg in reader.pages:
+        txt = pg.extract_text() or ""
         lines.extend([ln for ln in txt.splitlines() if ln.strip()])
     return lines
 
 def parse_carfax(lines, fname=""):
+    # VIN from content or filename
     vin = None
     for ln in lines:
         m = VIN_RE.search(ln)
@@ -101,162 +112,208 @@ def parse_carfax(lines, fname=""):
         "OdometerIssue": odo_issue
     }
 
-def parse_carfax_zip_with_cache(zip_file, cache):
-    """Binary-safe parse; only parse PDFs not already cached by VIN."""
+def parse_all_carfaxes_in_folder(cache: dict, skip_new_parse: bool) -> pd.DataFrame:
+    """
+    Reads PDFs in CARFAX_DIR. Uses cache to avoid re-parsing.
+    If skip_new_parse is True, just returns VIN presence from cache.
+    """
+    if skip_new_parse:
+        # Presence-only from cache
+        return pd.DataFrame({"VIN": list(cache.keys())}) if cache else pd.DataFrame(columns=["VIN"])
+
     results = {}
-    with zipfile.ZipFile(zip_file) as z:
-        pdfs = [n for n in z.namelist() if n.lower().endswith(".pdf")]
+    pdfs = [f for f in os.listdir(CARFAX_DIR) if f.lower().endswith(".pdf")]
+    for name in pdfs:
+        full = os.path.join(CARFAX_DIR, name)
+        # Prefer VIN from filename for quick cache hit
+        m = VIN_RE.search(name.upper())
+        vin = m.group(1) if m else None
+        if vin:
+            cached = get_cached(vin, cache)
+            if cached:
+                results[vin] = cached
+                continue
 
-        for name in pdfs:
-            m = VIN_RE.search(name.upper())
-            vin = m.group(1) if m else None
-
-            if vin:
-                cached = get_cached(vin, cache)
-                if cached:
-                    results[vin] = cached
-                    continue
-
-            with z.open(name) as f:
-                pdf_bytes = io.BytesIO(f.read())  # ensure binary mode
-                lines = extract_pdf_lines(pdf_bytes)
+        # Parse content only if not cached (or no VIN in filename)
+        try:
+            with open(full, "rb") as f:
+                pdf_bytes = io.BytesIO(f.read())
+            lines = extract_pdf_lines(pdf_bytes)
             rec = parse_carfax(lines, name)
             if rec:
                 results[rec["VIN"]] = rec
                 upsert_cache(rec["VIN"], rec, cache)
+        except Exception:
+            # Skip problematic PDFs but keep going
+            continue
 
     if not results:
+        # No parsed content; still return empty with VIN col to keep merge safe
         return pd.DataFrame(columns=[
-            "VIN","AccidentSeverity","OwnerCount","ServiceEvents",
-            "UsageType","OdometerIssue","last_updated"
+            "VIN","AccidentSeverity","OwnerCount","ServiceEvents","UsageType","OdometerIssue","last_updated"
         ])
     return pd.DataFrame(results.values())
 
-# ---------- Session state bootstrapping ----------
+def save_uploaded_inventory(file) -> str:
+    os.makedirs(LISTINGS_DIR, exist_ok=True)
+    # Prefix timestamp to avoid overwriting same-named uploads
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = file.name
+    out = os.path.join(LISTINGS_DIR, f"{stamp}__{base}")
+    with open(out, "wb") as f:
+        f.write(file.getbuffer())
+    return out
+
+def save_uploaded_carfax_zip(file) -> int:
+    os.makedirs(CARFAX_DIR, exist_ok=True)
+    added = 0
+    with zipfile.ZipFile(file) as z:
+        for name in z.namelist():
+            if name.lower().endswith(".pdf"):
+                # Flatten into CARFAX_DIR
+                raw = z.read(name)
+                # sanitize filename (strip folders)
+                base = os.path.basename(name)
+                # prevent overwriting identical names by prefixing timestamp
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out = os.path.join(CARFAX_DIR, f"{stamp}__{base}")
+                with open(out, "wb") as f:
+                    f.write(raw)
+                added += 1
+    return added
+
+def save_uploaded_carfax_pdfs(files) -> int:
+    os.makedirs(CARFAX_DIR, exist_ok=True)
+    added = 0
+    for file in files:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = os.path.join(CARFAX_DIR, f"{stamp}__{file.name}")
+        with open(out, "wb") as f:
+            f.write(file.getbuffer())
+        added += 1
+    return added
+
+# ------------------ Session State ------------------
 ss = st.session_state
-ss.setdefault("app_ready", False)       # True after first successful Process
-ss.setdefault("inv_df", None)           # last inventory DF
-ss.setdefault("inv_name", None)         # last inventory file name
-ss.setdefault("cf_df", None)            # last parsed Carfax DF (optional)
-ss.setdefault("cache_loaded", False)    # whether cache was loaded
-ss.setdefault("data_df", None)          # last merged data DF
+ss.setdefault("app_ready", False)
+ss.setdefault("inv_path", None)   # last inventory file path saved on disk
+ss.setdefault("data_df", None)    # processed/merged dataframe
 
-# ---------- Sidebar ----------
+# ------------------ Sidebar ------------------
 with st.sidebar:
-    st.header("Inventory & Carfax")
-    use_last_inv = st.checkbox("Use last uploaded inventory", value=bool(ss.get("inv_df") is not None))
-    inv_file = None if use_last_inv else st.file_uploader("Inventory (.csv or .xlsx)", type=["csv","xlsx"])
+    st.header("Inventory")
+    use_last_inv = st.checkbox("Use last saved inventory (data/listings)", value=True)
+    inv_upload = st.file_uploader("Upload new inventory (.csv/.xlsx)", type=["csv","xlsx"])
 
-    use_cache_only = st.checkbox("Use existing Carfax cache (skip ZIP parsing)", value=False)
-    carfax_zip = None if use_cache_only else st.file_uploader("Carfax ZIP (PDFs)", type=["zip"])
-    st.caption("Tip: PDF filenames should include the 17-character VIN.")
+    st.header("Carfax PDFs")
+    use_cache_only = st.checkbox("Use existing Carfax cache (skip parsing)", value=False)
+    cf_zip_upload = st.file_uploader("Upload Carfax ZIP (optional)", type=["zip"])
+    cf_pdf_uploads = st.file_uploader("Upload individual Carfax PDF(s)", type=["pdf"], accept_multiple_files=True)
+    st.caption("All Carfax PDFs are saved to data/carfaxes/ and reused automatically.")
 
     st.divider()
-    st.header("View & Actions")
     view_mode = st.radio("View Mode", ["🧱 Card View", "📊 Table View"], horizontal=True)
-    run_btn   = st.button("Process / Refresh")
-    reset_btn = st.button("Reset session")
 
-# Reset clears state but keeps cache file on disk
+    run_btn = st.button("Process / Refresh")
+    reset_btn = st.button("Reset session (keep files & cache)")
+
 if reset_btn:
-    for key in ["app_ready","inv_df","inv_name","cf_df","data_df","cache_loaded"]:
-        ss[key] = None if key.endswith("_df") else False
-    st.experimental_rerun()
-
-# ---------- Early exit guard ----------
-if not ss.get("app_ready") and not run_btn:
-    st.info("Upload or reuse inventory and Carfax options in the sidebar, then click **Process / Refresh**.")
+    ss["app_ready"] = False
+    ss["inv_path"] = None
+    ss["data_df"] = None
+    st.success("Session reset. Saved files & cache are intact.")
     st.stop()
 
-# ---------- Main Logic (guarded) ----------
+# ------------------ Pre-process saving ------------------
+# Save uploads immediately so they're available on next runs too
+if inv_upload is not None:
+    ss["inv_path"] = save_uploaded_inventory(inv_upload)
+    st.success(f"Inventory saved to {ss['inv_path']}")
+
+added = 0
+if cf_zip_upload is not None:
+    added += save_uploaded_carfax_zip(cf_zip_upload)
+if cf_pdf_uploads:
+    added += save_uploaded_carfax_pdfs(cf_pdf_uploads)
+if added:
+    st.success(f"Saved {added} Carfax PDF(s) into {CARFAX_DIR}")
+
+# ------------------ Early guard ------------------
+if not ss.get("app_ready") and not run_btn:
+    st.info("Upload or reuse inventory/Carfax files in the sidebar, then click **Process / Refresh**.")
+    st.stop()
+
+# ------------------ Main guarded processing ------------------
 try:
-    # -- Load or reuse inventory
-    if not use_last_inv:
-        if not inv_file:
-            if not ss.get("inv_df") is not None:
-                st.error("Please upload an inventory file or enable 'Use last uploaded inventory'.")
-                st.stop()
-        else:
-            # read fresh upload
-            if inv_file.name.lower().endswith(".csv"):
-                raw = pd.read_csv(inv_file)
-            else:
-                raw = pd.read_excel(inv_file)
-            raw.columns = [c.strip() for c in raw.columns]
-            vin_col = next((c for c in raw.columns if "vin" in c.lower()), None)
-            if not vin_col:
-                st.error("No VIN column found in inventory.")
-                st.stop()
-
-            inv = pd.DataFrame({
-                "VIN": raw[vin_col].astype(str).str.upper().str.strip(),
-                "Year": raw.get("Year"),
-                "Make": raw.get("Make"),
-                "Model": raw.get("Model"),
-                "Trim": raw.get("Trim"),
-                "Body": raw.get("Body"),
-                "Price": raw.get("Website Basis") if "Website Basis" in raw.columns else raw.get("Price"),
-                "KBBValue": raw.get("MSRP / KBB") if "MSRP / KBB" in raw.columns else raw.get("KBB"),
-                "Mileage": raw.get("Mileage"),
-                "Days": raw.get("Days In Inv") if "Days In Inv" in raw.columns else raw.get("DaysInInventory"),
-                "CPO": raw.get("CPO"),
-                "Warranty": raw.get("Warr.") if "Warr." in raw.columns else raw.get("Warranty"),
-                "Status": raw.get("Status")
-            })
-
-            ss["inv_df"] = inv
-            ss["inv_name"] = inv_file.name
-
-    # If user chose to reuse last inventory but we don't have it yet
-    if use_last_inv and ss.get("inv_df") is None:
-        st.error("No previous inventory found in session. Please upload once, then you can reuse it.")
+    # Resolve inventory path
+    inv_path = ss.get("inv_path")
+    if not use_last_inv and inv_upload is None and inv_path is None:
+        st.error("Please upload an inventory file or enable 'Use last saved inventory'.")
         st.stop()
 
-    inv = ss.get("inv_df")
+    if use_last_inv:
+        # Prefer the last explicitly chosen file, otherwise auto-pick newest in folder
+        if inv_path is None or not os.path.exists(inv_path):
+            auto = latest_file_in(LISTINGS_DIR)
+            if auto is None:
+                st.error("No saved inventory found in data/listings/. Please upload once.")
+                st.stop()
+            inv_path = auto
+            ss["inv_path"] = inv_path
 
-    # -- Load cache & Carfax
-    cache = load_cache()  # on-disk JSON cache (persists across sessions on same machine)
-    ss["cache_loaded"] = True
-
-    if use_cache_only:
-        # Don't parse ZIP; just mark Carfax presence by cache keys
-        cf = ss.get("cf_df")
-        if cf is None or cf.empty or "VIN" not in (cf.columns if isinstance(cf, pd.DataFrame) else []):
-            # Build a minimal cf from cache keys (presence only)
-            cached_vins = list(cache.keys())
-            cf = pd.DataFrame({"VIN": cached_vins})
-        ss["cf_df"] = cf
+    # Load inventory from disk
+    if inv_path.lower().endswith(".csv"):
+        raw = pd.read_csv(inv_path)
     else:
-        # Parse ZIP (if provided), otherwise reuse any previous cf_df
-        if carfax_zip:
-            with st.spinner("Parsing Carfax ZIP (skips cached VINs)…"):
-                cf = parse_carfax_zip_with_cache(carfax_zip, cache)
-            ss["cf_df"] = cf
-        else:
-            cf = ss.get("cf_df")
-            if cf is None:
-                # No ZIP and no prior Carfax DF; build minimal from cache
-                cached_vins = list(cache.keys())
-                cf = pd.DataFrame({"VIN": cached_vins})
-                ss["cf_df"] = cf
+        raw = pd.read_excel(inv_path)
+    raw.columns = [c.strip() for c in raw.columns]
+    vin_col = next((c for c in raw.columns if "vin" in c.lower()), None)
+    if not vin_col:
+        st.error("No VIN column found in inventory.")
+        st.stop()
 
-    # Defensive: ensure cf has VIN column
+    inv = pd.DataFrame({
+        "VIN": raw[vin_col].astype(str).str.upper().str.strip(),
+        "Year": raw.get("Year"),
+        "Make": raw.get("Make"),
+        "Model": raw.get("Model"),
+        "Trim": raw.get("Trim"),
+        "Body": raw.get("Body"),
+        "Price": (raw.get("Website Basis") if "Website Basis" in raw.columns else raw.get("Price")),
+        "KBBValue": (raw.get("MSRP / KBB") if "MSRP / KBB" in raw.columns else raw.get("KBB")),
+        "Mileage": raw.get("Mileage"),
+        "Days": (raw.get("Days In Inv") if "Days In Inv" in raw.columns else raw.get("DaysInInventory")),
+        "CPO": raw.get("CPO"),
+        "Warranty": (raw.get("Warr.") if "Warr." in raw.columns else raw.get("Warranty")),
+        "Status": raw.get("Status")
+    })
+
+    # Add numeric convenience columns for AI filtering
+    inv["PriceNum"] = inv["Price"].apply(to_num)
+    inv["MileageNum"] = inv["Mileage"].apply(to_num)
+
+    # Carfax cache and folder parsing
+    cache = load_cache()
+    if use_cache_only:
+        cf = parse_all_carfaxes_in_folder(cache, skip_new_parse=True)
+    else:
+        cf = parse_all_carfaxes_in_folder(cache, skip_new_parse=False)
+
+    # Defensive VIN-safe merge
     if cf is None or cf.empty or "VIN" not in cf.columns:
-        st.warning("⚠️ No valid VINs extracted from Carfax source.")
         cf = pd.DataFrame(columns=["VIN"])
-
-    # -- Merge
     data = inv.merge(cf, on="VIN", how="left")
     data["CarfaxUploaded"] = data["VIN"].isin(cf["VIN"]) if not cf.empty else False
 
-    # -- Derived placeholders (replace with your real scoring when ready)
-    rng = np.random.default_rng(42)
+    # Simple placeholder scores so UI renders (replace with your real scoring later)
+    rng = np.random.default_rng(7)
     data["Score"] = rng.integers(70, 96, len(data))
     data["SafetyScore"] = rng.integers(70, 96, len(data))
     data["ValueCategory"] = rng.choice(["Under Market","At Market","Over Market"], len(data))
     data["SalesMood"] = np.where(data["Score"]>=85,"🟢 Confident","🟡 Balanced")
 
-    # Persist processed data for subsequent reruns
+    # Persist for reruns
+    st.success(f"Inventory in use: {os.path.basename(inv_path)}")
     ss["data_df"] = data
     ss["app_ready"] = True
 
@@ -266,16 +323,17 @@ except Exception as e:
     st.code(traceback.format_exc())
     st.stop()
 
-# ---------- UI below uses persisted data (no reset on rerun) ----------
+# ------------------ Post-process / UI ------------------
 data = ss["data_df"].copy()
 
-# ---------- Filters & AI Query ----------
 st.divider()
 st.subheader("🔍 Search & Filters")
 
+# Natural query
 query_text = st.text_input("Ask naturally (e.g., 'SUV under 25k with AWD and low miles'):")
 use_ai = st.checkbox("Use AI Query", value=True)
 
+# Basic filters
 fc1, fc2, fc3, fc4 = st.columns(4)
 sc_min, sc_max = fc1.slider("Smart Score", 0, 100, (70, 100))
 safety_cut = fc2.slider("Min Safety", 0, 100, 70)
@@ -283,42 +341,40 @@ make_sel = fc3.multiselect("Make", sorted(list(data["Make"].dropna().unique())))
 val_sel = fc4.multiselect("Value Category", ["Under Market","At Market","Over Market"])
 
 mask = pd.Series(True, index=data.index)
-if "Score" in data.columns:
-    mask &= data["Score"].between(sc_min, sc_max)
-if "SafetyScore" in data.columns:
-    mask &= data["SafetyScore"] >= safety_cut
+mask &= data["Score"].between(sc_min, sc_max)
+mask &= data["SafetyScore"] >= safety_cut
 if make_sel:
     mask &= data["Make"].isin(make_sel)
 if val_sel:
     mask &= data["ValueCategory"].isin(val_sel)
 
-# AI natural query → structured filters (doesn't reset processed state)
+# AI → structured filters (use numeric columns PriceNum/MileageNum)
 if use_ai and query_text.strip():
     with st.spinner("Analyzing your query..."):
         filters = interpret_query(query_text)
     st.caption(f"🧠 Interpreted filters: {filters}")
 
     if "Body" in filters and "Body" in data.columns:
-        mask &= data["Body"].str.contains(filters["Body"], case=False, na=False)
+        mask &= data["Body"].astype(str).str.contains(filters["Body"], case=False, na=False)
     if "DriveTrain" in filters and "Drive Train" in data.columns:
-        mask &= data["Drive Train"].str.contains(filters["DriveTrain"], case=False, na=False)
+        mask &= data["Drive Train"].astype(str).str.contains(filters["DriveTrain"], case=False, na=False)
     if "Make" in filters and "Make" in data.columns:
-        mask &= data["Make"].str.contains(filters["Make"], case=False, na=False)
+        mask &= data["Make"].astype(str).str.contains(filters["Make"], case=False, na=False)
     if "Model" in filters and "Model" in data.columns:
-        mask &= data["Model"].str.contains(filters["Model"], case=False, na=False)
-    if "PriceMax" in filters and "Price" in data.columns:
-        mask &= data["Price"].apply(to_num) <= filters["PriceMax"]
-    if "PriceMin" in filters and "Price" in data.columns:
-        mask &= data["Price"].apply(to_num) >= filters["PriceMin"]
-    if "MileageMax" in filters and "Mileage" in data.columns:
-        mask &= data["Mileage"].apply(to_num) <= filters["MileageMax"]
-    if "MileageMin" in filters and "Mileage" in data.columns:
-        mask &= data["Mileage"].apply(to_num) >= filters["MileageMin"]
+        mask &= data["Model"].astype(str).str.contains(filters["Model"], case=False, na=False)
+    if "PriceMax" in filters and "PriceNum" in data.columns:
+        mask &= data["PriceNum"] <= filters["PriceMax"]
+    if "PriceMin" in filters and "PriceNum" in data.columns:
+        mask &= data["PriceNum"] >= filters["PriceMin"]
+    if "MileageMax" in filters and "MileageNum" in data.columns:
+        mask &= data["MileageNum"] <= filters["MileageMax"]
+    if "MileageMin" in filters and "MileageNum" in data.columns:
+        mask &= data["MileageNum"] >= filters["MileageMin"]
 
 mask = mask.reindex(data.index, fill_value=False)
 filtered = data.loc[mask].copy()
 
-# ---------- KPIs ----------
+# KPIs
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Vehicles", f"{len(data)}")
 col2.metric("Matches", f"{len(filtered)}")
@@ -328,17 +384,23 @@ col4.metric("Carfax Attached", f"{(filtered['CarfaxUploaded'].mean()*100 if not 
 st.divider()
 st.subheader(f"📋 Showing {len(filtered)} vehicles")
 
+# View toggle
 if filtered.empty:
     st.warning("No vehicles match your filters.")
 else:
     if "Card" in view_mode:
-        for _, r in filtered.head(50).iterrows():
+        for _, r in filtered.head(100).iterrows():
             with st.container(border=True):
                 c1, c2, c3 = st.columns([2,1,2])
                 with c1:
                     yr = int(r['Year']) if pd.notna(r['Year']) else ''
-                    st.markdown(f"**{yr} {r.get('Make','')} {r.get('Model','')} {r.get('Trim') or ''}**")
-                    st.write(f"{r.get('Body','') or ''} • {r.get('Mileage')} mi • ${r.get('Price')}")
+                    title = f"{yr} {r.get('Make','')} {r.get('Model','')} {r.get('Trim') or ''}".strip()
+                    st.markdown(f"**{title}**")
+                    # Bold price on its own line under title
+                    st.markdown(f"<div style='font-size:1.1rem'><b>${r.get('Price')}</b></div>", unsafe_allow_html=True)
+                    # Body & mileage as caption
+                    st.caption(f"{r.get('Body','') or ''} • {r.get('Mileage')} mi")
+                    # Carfax indicator
                     if r.get("CarfaxUploaded"): st.success("Carfax ✅")
                     else: st.warning("No Carfax")
                 with c2:
@@ -357,18 +419,18 @@ else:
         cols = [c for c in cols if c in filtered.columns]
         st.dataframe(filtered[cols], use_container_width=True, hide_index=True)
 
-# ---------- Downloads ----------
+# Downloads
 st.divider()
-colA, colB = st.columns(2)
-colA.download_button(
+cA, cB = st.columns(2)
+cA.download_button(
     "Download CSV",
-    data=filtered.to_csv(index=False).encode("utf-8"),
+    data=filtered.drop(columns=["PriceNum","MileageNum"], errors="ignore").to_csv(index=False).encode("utf-8"),
     file_name="filtered_results.csv",
     mime="text/csv"
 )
-colB.download_button(
+cB.download_button(
     "Download Excel",
-    data=to_excel_bytes(filtered),
+    data=to_excel_bytes(filtered.drop(columns=["PriceNum","MileageNum"], errors="ignore")),
     file_name="filtered_results.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
