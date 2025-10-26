@@ -1,16 +1,14 @@
 # -------------------------------------------------------------
-# Used Lot Command Center — AI Edition (Carfax + NHTSA + IIHS + Lead Match)
+# Used Lot Command Center — AI Edition (Fixed + Persistent Cache)
 # -------------------------------------------------------------
-import io, re, zipfile, json, time, os, requests
+import io, re, zipfile, json, os, requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import datetime
 from pypdf import PdfReader
 
-# -------------------------------------------------------------
-# Optional OpenAI Client (for AI IIHS + LeadMatch + TalkTrack)
-# -------------------------------------------------------------
+# ---------- OpenAI (optional) ----------
 try:
     from openai import OpenAI
     OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
@@ -19,9 +17,10 @@ except Exception:
     OPENAI_API_KEY = None
     openai_client = None
 
-# -------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------
+# ---------- Local cache helpers ----------
+from modules.carfax_cache import load_cache, get_cached, upsert_cache
+
+# ---------- Regex & scoring utils ----------
 VIN_RE = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
 LEGEND_RE = re.compile(r"damage\s+severity\s+scale.*minor.*moderate.*severe", re.I)
 ACC_TRIG = re.compile(r"(damage|accident)\s+reported", re.I)
@@ -38,8 +37,8 @@ def to_num(x):
 
 def value_bucket(r):
     if r is None or (isinstance(r,float) and np.isnan(r)): return ""
-    if r<=0.90: return "Under Market"
-    if r>=1.10: return "Over Market"
+    if r <= 0.90: return "Under Market"
+    if r >= 1.10: return "Over Market"
     return "At Market"
 
 def mileage_score(y, m):
@@ -72,16 +71,13 @@ def value_score(p, k):
     if r>=1.10: return max(0, 60 - (r-1.10)*300), r
     return (100 - ((r-0.9)/0.2)*40), r
 
-# -------------------------------------------------------------
-# Carfax Parsing (deep)
-# -------------------------------------------------------------
+# ---------- Carfax parsing ----------
 def extract_pdf_lines(file_like):
     reader = PdfReader(file_like)
     lines = []
     for pg in reader.pages:
         t = pg.extract_text() or ""
         lines.extend([ln for ln in t.splitlines() if ln.strip()])
-    # Remove legend noise so we don't false-flag severity
     return [ln for ln in lines if not LEGEND_RE.search(ln)]
 
 def parse_carfax(lines, fname=""):
@@ -95,8 +91,6 @@ def parse_carfax(lines, fname=""):
     if not vin: return None
 
     joined = "\n".join(lines)
-
-    # Severity detection
     severity = "none"
     if not CLEAN_PH.search(joined):
         for i, ln in enumerate(lines):
@@ -106,36 +100,23 @@ def parse_carfax(lines, fname=""):
                 severity = m.group(1).lower() if m else "minor"
                 break
 
-    # Owners, services, usage, odometer
-    owners = None
+    owners, services, usage = None, None, None
     for ln in lines:
         mo = OWNERS_RE.search(ln)
         if mo:
-            try:
-                owners = int(mo.group(1) or mo.group(2))
-                break
-            except:
-                pass
-
-    services = None
+            try: owners = int(mo.group(1) or mo.group(2)); break
+            except: pass
     for ln in lines:
         ms = SERVICE_RE.search(ln)
         if ms:
-            try:
-                services = int(ms.group(1))
-                break
-            except:
-                pass
-
-    usage = None
+            try: services = int(ms.group(1)); break
+            except: pass
     for ln in lines:
         mu = USAGE_RE.search(ln)
         if mu:
-            usage = mu.group(0).lower().replace(" use","")
-            break
+            usage = mu.group(0).lower().replace(" use",""); break
 
     odo_issue = "Yes" if ODOMETER_BAD.search(joined) else "No"
-
     return {
         "VIN": vin,
         "AccidentSeverity": severity,   # none/minor/moderate/severe
@@ -145,19 +126,53 @@ def parse_carfax(lines, fname=""):
         "OdometerIssue": odo_issue
     }
 
-def parse_carfax_zip(zf):
-    out = []
-    with zipfile.ZipFile(zf) as z:
-        for n in z.namelist():
-            if n.lower().endswith(".pdf"):
-                with z.open(n) as f: lines = extract_pdf_lines(f)
-                rec = parse_carfax(lines, n)
-                if rec: out.append(rec)
-    return pd.DataFrame(out)
+def parse_carfax_zip_with_cache(zip_file, cache: dict) -> pd.DataFrame:
+    """
+    Only parse PDFs whose VIN is NOT already in cache.
+    Returns a DataFrame for ALL VINs found (cached + newly parsed).
+    """
+    results = {}
 
-# -------------------------------------------------------------
-# NHTSA Recalls (public, no key)
-# -------------------------------------------------------------
+    with zipfile.ZipFile(zip_file) as z:
+        # First pass: discover VINs from filenames to hit cache quickly
+        pdf_names = [n for n in z.namelist() if n.lower().endswith(".pdf")]
+        for name in pdf_names:
+            m = VIN_RE.search(name.upper())
+            if m:
+                vin = m.group(1)
+                cached = get_cached(vin, cache)
+                if cached:
+                    results[vin] = cached
+
+        # Second pass: parse only missing VINs
+        for name in pdf_names:
+            m = VIN_RE.search(name.upper())
+            if not m:  # fallback: open and try reading a VIN from inside
+                with z.open(name) as f:
+                    lines = extract_pdf_lines(f)
+                rec = parse_carfax(lines, name)
+                if rec:
+                    vin = rec["VIN"]
+                    if vin not in results:
+                        results[vin] = rec
+                        upsert_cache(vin, rec, cache)
+                continue
+
+            vin = m.group(1)
+            if vin in results:
+                continue  # already cached
+            with z.open(name) as f:
+                lines = extract_pdf_lines(f)
+            rec = parse_carfax(lines, name)
+            if rec:
+                results[vin] = rec
+                upsert_cache(vin, rec, cache)
+
+    if not results:
+        return pd.DataFrame(columns=["VIN","AccidentSeverity","OwnerCount","ServiceEvents","UsageType","OdometerIssue","last_updated"])
+    return pd.DataFrame(results.values())
+
+# ---------- NHTSA ----------
 def nhtsa_recalls(vin):
     try:
         r = requests.get(f"https://api.nhtsa.gov/recalls/recallsByVin?vin={vin}", timeout=15)
@@ -166,18 +181,13 @@ def nhtsa_recalls(vin):
     except:
         return 0
 
-# -------------------------------------------------------------
-# IIHS Safety (official/heuristic → AI fallback)
-# -------------------------------------------------------------
+# ---------- IIHS (official heuristic → AI fallback) ----------
 @st.cache_data(ttl=60*60*24, show_spinner=False)
 def iihs_official(make, model, year):
-    """
-    Gentle heuristic: queries a public search page and looks for key phrases.
-    If we detect a clear signal, we return a 0-100 proxy.
-    """
     try:
         q = f"{year} {make} {model} IIHS rating"
-        r = requests.get("https://duckduckgo.com/html/", params={"q": q}, timeout=12, headers={"User-Agent":"Mozilla/5.0"})
+        r = requests.get("https://duckduckgo.com/html/", params={"q": q}, timeout=12,
+                         headers={"User-Agent":"Mozilla/5.0"})
         if r.status_code != 200: return {}
         h = r.text.lower()
         s = None
@@ -187,19 +197,18 @@ def iihs_official(make, model, year):
         elif "acceptable" in h: s = 70
         elif "marginal" in h: s = 55
         elif "poor" in h: s = 40
-        return {"source": "IIHS Official" if s else None, "score": s} if s else {}
+        return {"source":"IIHS Official","score":float(s)} if s else {}
     except:
         return {}
 
 @st.cache_data(ttl=60*60*24, show_spinner=False)
 def iihs_ai(make, model, year, nhtsa_score):
-    """AI fallback. Returns {} if no OpenAI key."""
     if not openai_client: return {}
     prompt = f"""
 Estimate a 0–100 IIHS-style safety score for a {year} {make} {model}.
-Use known IIHS patterns and the NHTSA-derived score {int(nhtsa_score)}.
+Use known trends and the NHTSA-derived score {int(nhtsa_score)}.
 Return JSON {{"score": int, "confidence": "high|medium|low"}} only.
-    """.strip()
+"""
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -215,7 +224,6 @@ Return JSON {{"score": int, "confidence": "high|medium|low"}} only.
         return {}
 
 def safety_blend(make, model, year, base):
-    """Blend NHTSA base safety with IIHS signals (official first, then AI)."""
     try:
         yr = int(year) if pd.notna(year) else None
         mk = str(make or "").strip()
@@ -229,21 +237,19 @@ def safety_blend(make, model, year, base):
 
         ai = iihs_ai(mk, mo, yr, float(base or 0))
         if ai.get("score") is not None:
-            return max(base, float(ai["score"])), ai.get("source", "IIHS AI"), ai.get("confidence", "medium")
+            return max(base, float(ai["score"])), ai.get("source","IIHS AI"), ai.get("confidence","medium")
 
         return base, "NHTSA Only", "—"
     except:
         return base, "NHTSA Only", "—"
 
-# -------------------------------------------------------------
-# Carfax Quality + Smart Score
-# -------------------------------------------------------------
+# ---------- Carfax quality + Smart Score ----------
 def carfax_quality(r):
-    sev = {"none": 30, "minor": 15, "moderate": -15, "severe": -40}.get(str(r.get("AccidentSeverity") or "none").lower(), 0)
+    sev = {"none":30,"minor":15,"moderate":-15,"severe":-40}.get(str(r.get("AccidentSeverity") or "none").lower(),0)
     owners = r.get("OwnerCount") or 1
     own_pts = 25 if owners==1 else (10 if owners==2 else -5)
-    svc = min(r.get("ServiceEvents") or 0, 12) / 12 * 10
-    rec = -10 * (r.get("RecallCount") or 0)
+    svc = min(r.get("ServiceEvents") or 0, 12)/12*10
+    rec = -10*(r.get("RecallCount") or 0)
     use = -15 if str(r.get("UsageType") or "").lower() in ("fleet","rental","commercial","taxi") else 0
     odo = -25 if str(r.get("OdometerIssue") or "").lower()=="yes" else 0
     return float(np.clip(70 + sev + own_pts + svc + rec + use + odo, 0, 100))
@@ -259,11 +265,8 @@ def total_smart_row(r):
     )
     return round(total,1), v_score, mr
 
-# -------------------------------------------------------------
-# AI Lead Matching & Talk Track
-# -------------------------------------------------------------
+# ---------- AI lead match & talk ----------
 def ai_lead_match(row, pref):
-    # Rule-based baseline
     rb = 0
     price = to_num(row.get("Price"))
     if pref.get("budget_max") and price and price <= pref["budget_max"]: rb += 30
@@ -292,7 +295,7 @@ Lead: {json.dumps(pref)}
 Vehicle: {json.dumps(vehicle)}
 Score the fit 0–100 and give a short reason.
 Return JSON {{"score": int, "why": "string"}} only.
-        """.strip()
+"""
         resp = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"system","content":"Output JSON only."},
@@ -301,30 +304,27 @@ Return JSON {{"score": int, "why": "string"}} only.
         )
         t = resp.choices[0].message.content.strip()
         d = json.loads(t) if t.startswith("{") else {}
-        if "score" in d:
-            return int(d["score"]), d.get("why","")
+        if "score" in d: return int(d["score"]), d.get("why","")
         return rb, "(fallback)"
     except:
         return rb, "(fallback)"
 
 def ai_talk(row):
     if not openai_client:
-        # Clean & confident fallback
-        segs = []
+        parts = []
         ymk = f"{int(row.get('Year')) if pd.notna(row.get('Year')) else ''} {row.get('Make','')} {row.get('Model','')}".strip()
-        segs.append(ymk)
-        if (row.get("OwnerCount") or 0) == 1: segs.append("1-owner")
+        parts.append(ymk)
+        if (row.get("OwnerCount") or 0)==1: parts.append("1-owner")
         sev = str(row.get("AccidentSeverity") or "none")
-        if sev == "none": segs.append("clean Carfax")
-        elif sev == "minor": segs.append("minor incident disclosed")
-        if (row.get("ServiceEvents") or 0) >= 6: segs.append("strong service history")
-        if (row.get("SafetyScore") or 0) >= 85: segs.append("top safety")
-        vc = value_bucket(row.get("MarketRatio"))
-        if vc == "Under Market": segs.append("under book")
-        return " • ".join([s for s in segs if s])[:180]
+        if sev=="none": parts.append("clean Carfax")
+        elif sev=="minor": parts.append("minor incident disclosed")
+        if (row.get("ServiceEvents") or 0) >= 6: parts.append("strong service history")
+        if (row.get("SafetyScore") or 0) >= 85: parts.append("top safety")
+        if value_bucket(row.get("MarketRatio"))=="Under Market": parts.append("under book")
+        return " • ".join([p for p in parts if p])[:180]
 
     v = {k: row.get(k) for k in ["Year","Make","Model","Trim","OwnerCount","AccidentSeverity","ServiceEvents","ValueCategory","RecallCount","SafetyScore"]}
-    prompt = f"Write one 20-25 word professional sentence to present this car: {json.dumps(v)}. Be calm, confident, and transparent."
+    prompt = f"Write one 20-25 word professional sentence to present this car: {json.dumps(v)}. Calm, transparent, no emojis."
     try:
         r = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -336,9 +336,19 @@ def ai_talk(row):
     except:
         return "Great choice with solid history and value."
 
-# -------------------------------------------------------------
-# UI
-# -------------------------------------------------------------
+# ---------- Safe table helper (prevents KeyErrors) ----------
+def show_table(df, wanted_cols, title=None, height=420):
+    if title: st.subheader(title)
+    if df is None or df.empty:
+        st.info("No rows to display.")
+        return
+    available = [c for c in wanted_cols if c in df.columns]
+    missing = [c for c in wanted_cols if c not in df.columns]
+    if missing:
+        st.caption("Note: missing columns → " + ", ".join(missing))
+    st.dataframe(df[available], use_container_width=True, height=height)
+
+# ===================== UI ===================== #
 st.set_page_config(page_title="Used Lot Command Center — AI", layout="wide")
 st.title("🚗 Used Lot Command Center — AI Edition")
 
@@ -393,20 +403,21 @@ inv = pd.DataFrame({
     "Status": raw.get("Status")
 })
 
-# Carfax parse (deep)
+# Parse Carfax with persistent cache
+cache = load_cache()
 cf = pd.DataFrame()
 if carfax_zip is not None:
-    with st.spinner("Parsing Carfax PDFs…"):
-        cf = parse_carfax_zip(carfax_zip)
+    with st.spinner("Parsing Carfax (skips cached VINs)…"):
+        cf = parse_carfax_zip_with_cache(carfax_zip, cache)
 
 data = inv.merge(cf, on="VIN", how="left")
 
-# NHTSA recall-derived safety base (no key)
+# NHTSA recalls → base safety
 with st.spinner("Fetching NHTSA recall data…"):
     data["RecallCount"] = [nhtsa_recalls(v) for v in data["VIN"]]
 data["SafetyScore"] = [max(0, 85 - (rc*7)) for rc in data["RecallCount"]]
 
-# IIHS blend (official/heuristic → AI fallback)
+# IIHS blend
 new_safety, srcs, confs = [], [], []
 with st.spinner("Blending IIHS safety (official/AI)…"):
     for _, r in data.iterrows():
@@ -416,7 +427,7 @@ data["SafetyScore"] = new_safety
 data["SafetySource"] = srcs
 data["SafetyConfidence"] = confs
 
-# Smart Score
+# Smart Score & mood
 scores, val_scores, ratios, cx_scores = [], [], [], []
 for _, r in data.iterrows():
     total, vs, mr = total_smart_row(r)
@@ -452,9 +463,7 @@ data["LeadMatch"] = lm_scores
 data["LeadWhy"] = lm_whys
 data["TalkTrack"] = tt_lines
 
-# -------------------------------------------------------------
-# KPIs
-# -------------------------------------------------------------
+# ---------- KPIs ----------
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Vehicles", f"{len(data)}")
 col2.metric("Avg Smart", f"{np.mean(data['Score']):.1f}")
@@ -463,9 +472,7 @@ col4.metric("Clean Carfax %", f"{(data['AccidentSeverity'].fillna('none')=='none
 
 st.divider()
 
-# -------------------------------------------------------------
-# Filters
-# -------------------------------------------------------------
+# ---------- Filters ----------
 st.subheader("Filters")
 fc1, fc2, fc3, fc4 = st.columns(4)
 sc_min, sc_max = fc1.slider("Smart Score", 0, 100, (70, 100))
@@ -478,29 +485,25 @@ if make_sel: mask &= data["Make"].isin(make_sel)
 if val_sel: mask &= data["ValueCategory"].isin(val_sel)
 filtered = data[mask].copy()
 
-# -------------------------------------------------------------
-# Tables
-# -------------------------------------------------------------
-st.subheader("🔥 Top Smart Deals")
+# ---------- Tables (safe) ----------
 top = filtered.sort_values(["Score","SmartValue"], ascending=False).head(15)
-st.dataframe(top[[
+top_cols = [
     "SalesMood","LeadMatch","LeadWhy","TalkTrack",
     "StockNumber","VIN","Year","Make","Model","Trim","Body","Mileage","Price","KBBValue",
     "MarketRatio","ValueCategory","AccidentSeverity","OwnerCount","ServiceEvents","UsageType",
     "OdometerIssue","RecallCount","SafetyScore","SafetySource","SafetyConfidence","CarfaxQuality","Score"
-]], use_container_width=True, height=420)
+]
+show_table(top, top_cols, title="🔥 Top Smart Deals", height=420)
 
-st.subheader("📊 Full Inventory (filtered)")
-st.dataframe(filtered[[
+inv_cols = [
     "SalesMood","LeadMatch","LeadWhy","TalkTrack",
     "StockNumber","VIN","Year","Make","Model","Trim","Body","Color","Mileage","Price","KBBValue",
     "MarketRatio","ValueCategory","Days","AccidentSeverity","OwnerCount","ServiceEvents","UsageType",
     "OdometerIssue","RecallCount","SafetyScore","SafetySource","SafetyConfidence","CarfaxQuality","Score","Status","CPO","Warranty"
-]], use_container_width=True)
+]
+show_table(filtered, inv_cols, title="📊 Full Inventory (filtered)")
 
-# -------------------------------------------------------------
-# Downloads
-# -------------------------------------------------------------
+# ---------- Downloads ----------
 st.subheader("⬇️ Export")
 stamp = datetime.now().strftime("%Y%m%d_%H%M")
 
@@ -523,4 +526,4 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-st.success("Ready. Upload fresh files any time to refresh scores.")
+st.success("Ready. Upload fresh files any time — cached VINs skip re-parse automatically.")
