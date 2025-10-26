@@ -86,9 +86,35 @@ def parse_carfax(lines, fname=""):
 
 def parse_carfax_zip_with_cache(zip_file, cache):
     results = {}
+
     with zipfile.ZipFile(zip_file) as z:
         pdfs = [n for n in z.namelist() if n.lower().endswith(".pdf")]
+
         for name in pdfs:
+            # --- try VIN from filename
             m = VIN_RE.search(name.upper())
             vin = m.group(1) if m else None
+
+            # --- if cached, skip re-parse
             if vin and (cached := get_cached(vin, cache)):
+                results[vin] = cached
+                continue
+
+            # --- otherwise parse normally
+            with z.open(name) as f:
+                pdf_bytes = io.BytesIO(f.read())  # binary mode fix
+                lines = extract_pdf_lines(pdf_bytes)
+
+            rec = parse_carfax(lines, name)
+            if rec:
+                results[rec["VIN"]] = rec
+                upsert_cache(rec["VIN"], rec, cache)
+
+    if not results:
+        return pd.DataFrame(
+            columns=[
+                "VIN","AccidentSeverity","OwnerCount","ServiceEvents",
+                "UsageType","OdometerIssue","last_updated"
+            ]
+        )
+    return pd.DataFrame(results.values())
