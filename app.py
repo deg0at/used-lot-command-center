@@ -320,16 +320,39 @@ def calc_vehicle_story(row: pd.Series):
     return score, label
 
 def summarize_carfax(row: pd.Series):
-    """Readable summary line from parsed fields."""
+    """Readable summary line from parsed fields — fully safe against None/NaN."""
     parts = []
+
     sev = row.get("AccidentSeverity")
-    if sev and sev != "none": parts.append(f"{sev.title()} accident reported")
-    elif sev == "none":       parts.append("No accidents reported")
-    if row.get("OwnerCount"): parts.append(f"{int(row['OwnerCount'])} owner{'s' if int(row['OwnerCount'])!=1 else ''}")
-    if row.get("ServiceEvents"): parts.append(f"{int(row['ServiceEvents'])} service record{'s' if int(row['ServiceEvents'])!=1 else ''}")
-    if row.get("UsageType"): parts.append(f"{row['UsageType'].title()} use")
-    if row.get("OdometerIssue") == "Yes": parts.append("⚠️ Odometer issue")
+    if isinstance(sev, str):
+        sev_lower = sev.lower()
+        if sev_lower != "none":
+            parts.append(f"{sev_lower.title()} accident reported")
+        else:
+            parts.append("No accidents reported")
+    else:
+        parts.append("No accident data")
+
+    owners = row.get("OwnerCount")
+    if owners and not pd.isna(owners):
+        owners_int = int(owners)
+        parts.append(f"{owners_int} owner{'s' if owners_int != 1 else ''}")
+
+    services = row.get("ServiceEvents")
+    if services and not pd.isna(services):
+        services_int = int(services)
+        parts.append(f"{services_int} service record{'s' if services_int != 1 else ''}")
+
+    usage = row.get("UsageType")
+    if isinstance(usage, str) and usage.strip():
+        parts.append(f"{usage.title()} use")
+
+    odo = row.get("OdometerIssue")
+    if isinstance(odo, str) and odo.strip().lower() == "yes":
+        parts.append("⚠️ Odometer issue")
+
     return " • ".join(parts) if parts else "No Carfax data available."
+
 
 # ------------------ AI helpers ------------------
 def ai_interpret_query(prompt: str) -> dict:
