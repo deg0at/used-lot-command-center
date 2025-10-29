@@ -1,10 +1,10 @@
 # ==============================================================
-# Used Lot Command Center — Hybrid AI Edition (v10)
+# Used Lot Command Center — Hybrid AI Edition (v11)
 # - Persistent storage (listings, carfaxes, caches)
-# - Auto-parse new Carfax PDFs; load caches on startup
-# - Per-VIN AI story buttons with caching
+# - Auto-parse only new Carfax PDFs; cached forever
+# - Per-VIN AI story buttons (cached)
 # - GPT-powered AI Search (fallback parser if no key)
-# - Safe column selection (no KeyErrors)
+# - Safe/NaN-proof scoring + summaries + owner ratings
 # ==============================================================
 
 import io, os, re, json, zipfile, traceback
@@ -28,10 +28,9 @@ STORY_CACHE_PATH  = os.path.join(DATA_DIR, "story_cache.json")
 # Ensure folders/files exist
 os.makedirs(CARFAX_DIR, exist_ok=True)
 os.makedirs(LISTINGS_DIR, exist_ok=True)
-if not os.path.exists(CARFAX_CACHE_PATH):
-    with open(CARFAX_CACHE_PATH, "w") as f: f.write("{}")
-if not os.path.exists(STORY_CACHE_PATH):
-    with open(STORY_CACHE_PATH, "w") as f: f.write("{}")
+for fpath in [CARFAX_CACHE_PATH, STORY_CACHE_PATH]:
+    if not os.path.exists(fpath):
+        with open(fpath, "w") as f: f.write("{}")
 
 VIN_RE = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
 
@@ -60,18 +59,6 @@ def save_json(path: str, data: dict):
             json.dump(data, f, indent=2)
     except Exception:
         pass
-
-carfax_cache = load_json(CARFAX_CACHE_PATH)  # {VIN: parsed dict}
-story_cache  = load_json(STORY_CACHE_PATH)   # {VIN: story str}
-
-def upsert_carfax_cache(vin: str, rec: dict):
-    rec = {**rec, "last_updated": datetime.now().isoformat(timespec="seconds")}
-    carfax_cache[vin] = rec
-    save_json(CARFAX_CACHE_PATH, carfax_cache)
-
-def upsert_story_cache(vin: str, story: str):
-    story_cache[vin] = story
-    save_json(STORY_CACHE_PATH, story_cache)
 
 def latest_file_in(dirpath: str):
     files = [os.path.join(dirpath, f) for f in os.listdir(dirpath)
@@ -246,7 +233,20 @@ def carfax_cache_as_df() -> pd.DataFrame:
         rows.append(row)
     return pd.DataFrame(rows)
 
-# ------------------ Carfax scoring & summaries ------------------
+# ------------------ Cache upserts ------------------
+carfax_cache = load_json(CARFAX_CACHE_PATH)  # {VIN: parsed dict}
+story_cache  = load_json(STORY_CACHE_PATH)   # {VIN: story str}
+
+def upsert_carfax_cache(vin: str, rec: dict):
+    rec = {**rec, "last_updated": datetime.now().isoformat(timespec="seconds")}
+    carfax_cache[vin] = rec
+    save_json(CARFAX_CACHE_PATH, carfax_cache)
+
+def upsert_story_cache(vin: str, story: str):
+    story_cache[vin] = story
+    save_json(STORY_CACHE_PATH, story_cache)
+
+# ------------------ Scoring & Summaries ------------------
 def estimate_service_interval(row: pd.Series):
     """Estimate miles per service event if mileage data exists."""
     try:
@@ -260,10 +260,10 @@ def estimate_service_interval(row: pd.Series):
 
 def carfax_quality_score(row: pd.Series):
     """0–100 quality score from accidents, owners, service, major parts."""
-    sev = row.get("AccidentSeverity", "none")
-    owners = row.get("OwnerCount", 1) or 1
-    services = row.get("ServiceEvents", 0) or 0
-    major_parts = row.get("MajorParts", "None")
+    sev = str(row.get("AccidentSeverity") or "none").lower()
+    owners = row.get("OwnerCount") or 1
+    services = row.get("ServiceEvents") or 0
+    major_parts = row.get("MajorParts") or "None"
 
     score = 80
     # Accidents
@@ -277,7 +277,7 @@ def carfax_quality_score(row: pd.Series):
     if services >= 6: score += 10
     elif services <= 1: score -= 10
     # Major parts
-    if major_parts and major_parts != "None":
+    if isinstance(major_parts, str) and major_parts.strip() and major_parts != "None":
         score -= 10 * len([p for p in major_parts.split(",") if p.strip()])
 
     score = max(0, min(100, score))
@@ -287,28 +287,30 @@ def carfax_quality_score(row: pd.Series):
 def calc_vehicle_story(row: pd.Series):
     """Vehicle Story Index (VSI): blends history + owner behavior + service cadence."""
     score = 80
-    sev = row.get("AccidentSeverity", "none")
+    sev = str(row.get("AccidentSeverity") or "none").lower()
     if sev == "minor": score -= 5
     elif sev == "moderate": score -= 15
     elif sev == "severe": score -= 25
 
-    owners = row.get("OwnerCount", 1) or 1
-    services = row.get("ServiceEvents", 0) or 0
+    owners = row.get("OwnerCount") or 1
+    services = row.get("ServiceEvents") or 0
     interval = row.get("AvgServiceInterval", None)
-    parts = row.get("MajorParts", "None")
+    parts = row.get("MajorParts") or "None"
+    ratings = row.get("OwnerRatings") or []
 
     # Owner stability
-    score -= max(0, owners - 2) * 5
+    if owners > 2:
+        score -= 5 * (owners - 2)
     # Service cadence
     if services >= 5: score += 5
-    if interval and interval < 7000: score += 5
-    elif interval and interval > 10000: score -= 5
+    if interval and isinstance(interval, (int,float)):
+        if interval < 7000: score += 5
+        elif interval > 10000: score -= 5
     # Major parts penalty
-    if parts and parts != "None":
+    if isinstance(parts, str) and parts.strip() and parts != "None":
         score -= 5 * len([p for p in parts.split(",") if p.strip()])
 
     # Per-owner consistency (if available)
-    ratings = row.get("OwnerRatings", [])
     if isinstance(ratings, list) and ratings:
         owner_avg = sum(o.get("Score", 0) for o in ratings) / len(ratings)
         score = (score + owner_avg) / 2
@@ -339,6 +341,7 @@ def ai_interpret_query(prompt: str) -> dict:
         if "truck" in q: filters["Body"] = "Truck"
         if "sedan" in q: filters["Body"] = "Sedan"
         if "coupe" in q: filters["Body"] = "Coupe"
+        if "van" in q: filters["Body"] = "Van"
         if "awd" in q or "4wd" in q: filters["DriveTrain"] = "AWD"
         if "fwd" in q: filters["DriveTrain"] = "FWD"
         if "rwd" in q: filters["DriveTrain"] = "RWD"
@@ -513,19 +516,19 @@ if reset_btn:
 added_pdfs = 0
 if inv_upload is not None:
     ss["inv_path"] = save_uploaded_inventory(inv_upload)
-    st.success(f"Inventory saved to {ss['inv_path']}")
+    st.sidebar.success(f"Inventory saved to {ss['inv_path']}")
 
 if cf_zip_upload is not None:
     try:
         added_pdfs += save_uploaded_carfax_zip(cf_zip_upload)
     except zipfile.BadZipFile:
-        st.error("The uploaded file is not a valid ZIP. Please re-save and upload again.")
+        st.sidebar.error("The uploaded file is not a valid ZIP. Please re-save and upload again.")
 
 if cf_pdf_uploads:
     added_pdfs += save_uploaded_carfax_pdfs(cf_pdf_uploads)
 
 if added_pdfs:
-    st.success(f"Saved {added_pdfs} Carfax PDF(s) into {CARFAX_DIR}")
+    st.sidebar.success(f"Saved {added_pdfs} Carfax PDF(s) into {CARFAX_DIR}")
 
 # ------------------ Auto-Load & Parse ------------------
 # 1) Choose inventory file (latest if none uploaded)
@@ -542,9 +545,10 @@ if inv_path is None or not os.path.exists(inv_path):
     st.stop()
 
 # 2) Auto-parse any new Carfax PDFs (once)
-new_count = parse_new_carfax_pdfs()
-if new_count:
-    st.info(f"Parsed {new_count} new Carfax PDF(s) and updated cache.")
+if process_btn or added_pdfs or True:
+    new_count = parse_new_carfax_pdfs()
+    if new_count:
+        st.info(f"Parsed {new_count} new Carfax PDF(s) and updated cache.")
 
 # 3) Build Carfax DataFrame from cache
 cf_df = carfax_cache_as_df()
@@ -628,12 +632,11 @@ data["ValueCategory"] = np.where(
 data["SalesMood"] = np.where(data["Score"]>=85,"🟢 Confident","🟡 Balanced")
 
 # Save to session
-st.success(f"Inventory in use: {os.path.basename(inv_path)}")
 ss["data_df"] = data.copy()
 
 # ------------------ TABS ------------------
-tab_overview, tab_ai, tab_market, tab_safety, tab_alerts = st.tabs(
-    ["📊 Overview", "🧠 AI Search", "💹 Market Insights", "🛡 Safety", "⚠ Alerts"]
+tab_overview, tab_ai, tab_alerts = st.tabs(
+    ["📊 Overview", "🧠 AI Search", "⚠ Alerts"]
 )
 
 # ========== Overview ==========
@@ -661,7 +664,7 @@ with tab_overview:
 with tab_ai:
     data = ss["data_df"].copy()
     st.subheader("Natural Language Search & Cards")
-    st.caption("Tip: set your OpenAI key in .streamlit/secrets.toml for best results.")
+    st.caption("Tip: add your OpenAI key in .streamlit/secrets.toml for best results.")
 
     query_text = st.text_input("Try: 'SUV under 25k with AWD and under 40k miles (2018 to 2022)'")
     fc1, fc2, fc3, fc4 = st.columns(4)
@@ -727,7 +730,7 @@ with tab_ai:
                         svc_interval = r.get("AvgServiceInterval")
                         svc_info = f" • Avg service every ~{int(svc_interval):,} mi" if svc_interval else ""
                         major_parts = r.get("MajorParts", "None")
-                        major_info = f" • Major parts replaced: {major_parts}" if major_parts and major_parts != "None" else ""
+                        major_info = f" • Major parts replaced: {major_parts}" if isinstance(major_parts, str) and major_parts and major_parts != "None" else ""
                         st.markdown(f"_{summary}{svc_info}{major_info}_")
                         st.caption(f"**Vehicle Story: {r.get('StoryLabel','?')} ({int(r.get('StoryScore',0))}/100)**")
 
@@ -789,34 +792,6 @@ with tab_ai:
         file_name="filtered_results.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
-# ========== Market Insights (prototype) ==========
-with tab_market:
-    data = ss["data_df"].copy()
-    st.subheader("Market Insights")
-    if {"Make","Model"}.issubset(set(data.columns)):
-        grp = data.groupby(["Make","Model"], dropna=False).agg(
-            Count     = ("VIN","count"),
-            AvgPrice  = ("PriceNum","mean"),
-            AvgMiles  = ("MileageNum","mean"),
-            AvgSmart  = ("Score","mean"),
-            AvgStory  = ("StoryScore","mean"),
-        ).reset_index().sort_values("AvgSmart", ascending=False)
-        st.dataframe(grp, use_container_width=True, hide_index=True)
-    else:
-        st.info("Make/Model columns missing in inventory.")
-
-# ========== Safety ==========
-with tab_safety:
-    data = ss["data_df"].copy()
-    st.subheader("Safety Overview")
-    if "SafetyScore" in data.columns:
-        st.metric("Average Safety Score", f"{data['SafetyScore'].mean():.1f}")
-        cols = [c for c in ["VIN","Year","Make","Model","SafetyScore","AccidentSeverity","ServiceEvents"] if c in data.columns]
-        sample = data[cols].copy()
-        st.dataframe(sample.sort_values("SafetyScore", ascending=False).head(50), use_container_width=True, hide_index=True)
-    else:
-        st.info("SafetyScore not available yet.")
 
 # ========== Alerts ==========
 with tab_alerts:
