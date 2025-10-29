@@ -751,7 +751,12 @@ with tab_ai:
                         # Carfax summary & story label
                         summary = summarize_carfax(r)
                         svc_interval = r.get("AvgServiceInterval")
-                        svc_info = f" • Avg service every ~{int(svc_interval):,} mi" if svc_interval else ""
+svc_info = ""
+try:
+    if svc_interval and not pd.isna(svc_interval):
+        svc_info = f" • Avg service every ~{int(float(svc_interval)):,} mi"
+except Exception:
+    svc_info = ""
                         major_parts = r.get("MajorParts", "None")
                         major_info = f" • Major parts replaced: {major_parts}" if isinstance(major_parts, str) and major_parts and major_parts != "None" else ""
                         st.markdown(f"_{summary}{svc_info}{major_info}_")
