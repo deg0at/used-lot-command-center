@@ -36,6 +36,17 @@ for fpath in [CARFAX_CACHE_PATH, STORY_CACHE_PATH, CARFAX_PARSE_INDEX_PATH]:
     if not os.path.exists(fpath):
         with open(fpath, "w") as f: f.write("{}")
 
+
+# Session state helpers for vehicle table/card views
+if "inventory_view_mode" not in st.session_state:
+    st.session_state["inventory_view_mode"] = "table"
+if "inventory_selected_vin" not in st.session_state:
+    st.session_state["inventory_selected_vin"] = None
+if "inventory_selected_row_position" not in st.session_state:
+    st.session_state["inventory_selected_row_position"] = None
+if "inventory_table_selection" not in st.session_state:
+    st.session_state["inventory_table_selection"] = {"rows": []}
+
 VIN_RE = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
 URL_RE = re.compile(r"https?://[^\s\"'>)]+", re.IGNORECASE)
 
@@ -151,6 +162,212 @@ def find_carfax_file(vin: str):
         return matches[0][1]
 
     return None
+
+
+def clear_inventory_selection_state(trigger_rerun: bool = False):
+    """Reset session state used for toggling between the table and card views."""
+
+    st.session_state["inventory_view_mode"] = "table"
+    st.session_state["inventory_selected_vin"] = None
+    st.session_state["inventory_selected_row_position"] = None
+    st.session_state["inventory_table_selection"] = {"rows": []}
+    st.session_state.pop("inventory_table", None)
+
+    if trigger_rerun:
+        st.experimental_rerun()
+
+
+def render_vehicle_card(row: pd.Series, ai_enabled: bool, show_full_details: bool = False):
+    """Render a single vehicle card with summary metrics and optional full details."""
+
+    vin_value = str(row.get("VIN") or "Unknown VIN")
+
+    def _clean_text(value) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if value is None:
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+        return str(value)
+
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([2, 1, 2])
+
+        with c1:
+            year_val = row.get("Year")
+            try:
+                yr = int(float(year_val)) if pd.notna(year_val) else ""
+            except (TypeError, ValueError):
+                yr = ""
+
+            title = f"{yr} {row.get('Make','')} {row.get('Model','')} {row.get('Trim') or ''}".strip()
+            st.markdown(f"**{title or 'Vehicle'}**")
+            price_raw = row.get("Price")
+            price_text = _clean_text(price_raw)
+            if not price_text:
+                price_text = "—"
+            st.markdown(
+                f"<div style='font-size:1.1rem'><b>{price_text}</b></div>",
+                unsafe_allow_html=True,
+            )
+
+            body_text = _clean_text(row.get("Body"))
+            drivetrain_text = _clean_text(row.get("Drive Train"))
+            mileage_raw = row.get("Mileage")
+            mileage_text = ""
+            if isinstance(mileage_raw, str):
+                mileage_text = mileage_raw.strip()
+            elif mileage_raw is not None:
+                try:
+                    if not pd.isna(mileage_raw):
+                        mileage_text = f"{int(float(mileage_raw)):,}"
+                except Exception:
+                    mileage_text = str(mileage_raw)
+            mileage_display = ""
+            if mileage_text:
+                lower_mileage = mileage_text.lower()
+                if lower_mileage.endswith("mi") or "mile" in lower_mileage:
+                    mileage_display = mileage_text
+                else:
+                    mileage_display = f"{mileage_text} mi"
+            descriptors = " • ".join(
+                [
+                    txt
+                    for txt in [body_text, mileage_display, drivetrain_text]
+                    if txt
+                ]
+            )
+            if descriptors:
+                st.caption(descriptors)
+
+            st.caption(f"VIN: {vin_value}")
+
+            summary = summarize_carfax(row)
+            svc_interval = row.get("AvgServiceInterval")
+            svc_info = ""
+            try:
+                if svc_interval and not pd.isna(svc_interval):
+                    svc_info = f" • Avg service every ~{int(float(svc_interval)):,} mi"
+            except Exception:
+                svc_info = ""
+            major_parts = row.get("MajorParts", "None")
+            major_info = (
+                f" • Major parts replaced: {major_parts}"
+                if isinstance(major_parts, str) and major_parts and major_parts != "None"
+                else ""
+            )
+            st.markdown(f"_{summary}{svc_info}{major_info}_")
+            st.caption(
+                f"**Vehicle Story: {row.get('StoryLabel','?')} ({int(row.get('StoryScore',0))}/100)**"
+            )
+
+            owner_ratings = row.get("OwnerRatings")
+            if isinstance(owner_ratings, list) and owner_ratings:
+                owners_summary = " • ".join(
+                    [
+                        f"Owner {o.get('Owner')}: {o.get('Score')}/100"
+                        for o in owner_ratings
+                        if isinstance(o, dict)
+                    ]
+                )
+                if owners_summary:
+                    st.caption(f"Owner Ratings: {owners_summary}")
+
+            carfax_link = clean_carfax_link(row.get("CarfaxLink", ""))
+            cf_path = find_carfax_file(vin_value)
+            pdf_bytes = None
+
+            if cf_path and os.path.exists(cf_path):
+                try:
+                    with open(cf_path, "rb") as f:
+                        pdf_bytes = f.read()
+                except OSError:
+                    pdf_bytes = None
+
+            if carfax_link:
+                st.markdown(
+                    (
+                        "<a style='display:inline-block;margin-bottom:0.5rem;padding:0.35rem 0.75rem;"
+                        "background-color:#1f77b4;color:white;border-radius:4px;text-decoration:none;'"
+                        f" href='{carfax_link}' target='_blank'>🔍 View Carfax</a>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+            elif pdf_bytes:
+                carfax_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+                st.markdown(
+                    (
+                        "<a style='display:inline-block;margin-bottom:0.5rem;padding:0.35rem 0.75rem;"
+                        "background-color:#1f77b4;color:white;border-radius:4px;text-decoration:none;'"
+                        f" href='data:application/pdf;base64,{carfax_b64}' target='_blank'>🔍 View Carfax</a>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+            if pdf_bytes:
+                st.download_button(
+                    "📄 Download Carfax PDF",
+                    pdf_bytes,
+                    file_name=os.path.basename(cf_path) if cf_path else f"{vin_value}_carfax.pdf",
+                    mime="application/pdf",
+                    key=f"dl_{vin_value}",
+                )
+
+            if not carfax_link and not pdf_bytes:
+                st.caption("No Carfax file found for this VIN.")
+
+            if st.button(f"🧠 Generate Story for {vin_value}", key=f"story_{vin_value}"):
+                with st.spinner(
+                    "Generating story..." if ai_enabled else "Loading cached/fallback story..."
+                ):
+                    story = ai_vehicle_story(row.get("VIN", ""), row.get("CarfaxText", "") or "")
+                st.write(f"**AI Story:** {story}")
+
+        with c2:
+            score = row.get("Score")
+            safety = row.get("SafetyScore")
+            carfax_score = row.get("CarfaxQualityScore")
+            value_cat = row.get("ValueCategory", "—")
+
+            try:
+                smart_value = f"{float(score):.0f}"
+            except Exception:
+                smart_value = _clean_text(score) or "—"
+
+            try:
+                safety_value = f"{float(safety):.0f}"
+            except Exception:
+                safety_value = _clean_text(safety) or "—"
+
+            try:
+                carfax_value = f"{int(float(carfax_score))}/100"
+            except Exception:
+                carfax_value = _clean_text(carfax_score) or "—"
+
+            st.metric("Smart", smart_value)
+            st.metric("Safety", safety_value)
+            st.metric("Carfax", carfax_value)
+            st.metric("Value", value_cat)
+
+        with c3:
+            tt = ai_talk_track(row) if ai_enabled else ""
+            if tt:
+                st.caption(tt)
+
+        if show_full_details:
+            details_df = pd.DataFrame(
+                {
+                    "Field": list(row.index),
+                    "Value": [row.get(col) for col in row.index],
+                }
+            )
+            st.markdown("#### Full Vehicle Details")
+            st.dataframe(details_df, use_container_width=True, hide_index=True)
+
 
 # ------------------ PDF Parsing ------------------
 def extract_pdf_lines(file_like_binary) -> list:
@@ -990,6 +1207,9 @@ with tab_finder:
 
     view_as_cards = st.toggle("Card View", value=True)
 
+    if view_as_cards and st.session_state.get("inventory_view_mode") != "table":
+        clear_inventory_selection_state()
+
     mask = pd.Series(True, index=data.index)
     mask &= data["Score"].between(sc_min, sc_max)
     mask &= data["SafetyScore"] >= min_safety
@@ -1012,98 +1232,14 @@ with tab_finder:
 
     if filtered.empty:
         st.warning("No vehicles match the selected filters. Try widening your range or clearing filters.")
+        clear_inventory_selection_state()
     else:
         if view_as_cards:
             for _, r in filtered.head(120).iterrows():
-                with st.container(border=True):
-                    c1, c2, c3 = st.columns([2, 1, 2])
-
-                    with c1:
-                        year_val = r.get('Year')
-                        try:
-                            yr = int(float(year_val)) if pd.notna(year_val) else ''
-                        except (TypeError, ValueError):
-                            yr = ''
-                        title = f"{yr} {r.get('Make','')} {r.get('Model','')} {r.get('Trim') or ''}".strip()
-                        st.markdown(f"**{title}**")
-                        st.markdown(f"<div style='font-size:1.1rem'><b>${r.get('Price')}</b></div>", unsafe_allow_html=True)
-                        st.caption(f"{r.get('Body','') or ''} • {r.get('Mileage')} mi • {r.get('Drive Train') or ''}")
-
-                        summary = summarize_carfax(r)
-                        svc_interval = r.get("AvgServiceInterval")
-                        svc_info = ""
-                        try:
-                            if svc_interval and not pd.isna(svc_interval):
-                                svc_info = f" • Avg service every ~{int(float(svc_interval)):,} mi"
-                        except Exception:
-                            svc_info = ""
-                        major_parts = r.get("MajorParts", "None")
-                        major_info = f" • Major parts replaced: {major_parts}" if isinstance(major_parts, str) and major_parts and major_parts != "None" else ""
-                        st.markdown(f"_{summary}{svc_info}{major_info}_")
-                        st.caption(f"**Vehicle Story: {r.get('StoryLabel','?')} ({int(r.get('StoryScore',0))}/100)**")
-
-                        if isinstance(r.get("OwnerRatings"), list) and r["OwnerRatings"]:
-                            owners_summary = " • ".join([f"Owner {o['Owner']}: {o['Score']}/100" for o in r["OwnerRatings"]])
-                            st.caption(f"Owner Ratings: {owners_summary}")
-
-                        carfax_link = clean_carfax_link(r.get("CarfaxLink", ""))
-                        cf_path = find_carfax_file(r['VIN'])
-                        pdf_bytes = None
-
-                        if cf_path and os.path.exists(cf_path):
-                            with open(cf_path, "rb") as f:
-                                pdf_bytes = f.read()
-
-                        if carfax_link:
-                            st.markdown(
-                                (
-                                    "<a style='display:inline-block;margin-bottom:0.5rem;padding:0.35rem 0.75rem;"
-                                    "background-color:#1f77b4;color:white;border-radius:4px;text-decoration:none;'"
-                                    f" href='{carfax_link}' target='_blank'>🔍 View Carfax</a>"
-                                ),
-                                unsafe_allow_html=True,
-                            )
-                        elif pdf_bytes:
-                            carfax_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-                            st.markdown(
-                                (
-                                    "<a style='display:inline-block;margin-bottom:0.5rem;padding:0.35rem 0.75rem;"
-                                    "background-color:#1f77b4;color:white;border-radius:4px;text-decoration:none;'"
-                                    f" href='data:application/pdf;base64,{carfax_b64}' target='_blank'>🔍 View Carfax</a>"
-                                ),
-                                unsafe_allow_html=True,
-                            )
-
-                        if pdf_bytes:
-                            st.download_button(
-                                "📄 Download Carfax PDF",
-                                pdf_bytes,
-                                file_name=os.path.basename(cf_path),
-                                mime="application/pdf",
-                                key=f"dl_{r['VIN']}"
-                            )
-
-                        if not carfax_link and not pdf_bytes:
-                            st.caption("No Carfax file found for this VIN.")
-
-                        if st.button(f"🧠 Generate Story for {r['VIN']}", key=f"story_{r['VIN']}"):
-                            with st.spinner("Generating story..." if ai_enabled else "Loading cached/fallback story..."):
-                                story = ai_vehicle_story(r["VIN"], r.get("CarfaxText","") or "")
-                            st.write(f"**AI Story:** {story}")
-
-                    with c2:
-                        st.metric("Smart", f"{r['Score']:.0f}")
-                        st.metric("Safety", f"{r['SafetyScore']:.0f}")
-                        st.metric("Carfax", f"{int(r['CarfaxQualityScore'])}/100")
-                        st.metric("Value", r.get("ValueCategory","—"))
-
-                    with c3:
-                        tt = ai_talk_track(r) if ai_enabled else ""
-                        if tt:
-                            st.caption(tt)
-
-                    st.divider()
+                render_vehicle_card(r, ai_enabled)
+                st.divider()
         else:
+            filtered_reset = filtered.reset_index(drop=True)
             cols = [
                 "CarfaxUploaded","VIN","Year","Make","Model","Trim","Body","Drive Train",
                 "Mileage","Price","KBBValue","ValueCategory",
@@ -1111,8 +1247,58 @@ with tab_finder:
                 "CarfaxQualityLabel","CarfaxQualityScore","StoryLabel","StoryScore",
                 "SafetyScore","Score","Days","Status"
             ]
-            cols = [c for c in cols if c in filtered.columns]
-            st.dataframe(filtered[cols], use_container_width=True, hide_index=True)
+            cols = [c for c in cols if c in filtered_reset.columns]
+
+            view_mode = st.session_state.get("inventory_view_mode", "table")
+
+            if view_mode == "card":
+                selected_pos = st.session_state.get("inventory_selected_row_position")
+                if selected_pos is None or selected_pos >= len(filtered_reset):
+                    clear_inventory_selection_state(trigger_rerun=True)
+                else:
+                    selected_row = filtered_reset.iloc[selected_pos]
+                    st.caption("Tap the button below to return to the table view.")
+                    render_vehicle_card(selected_row, ai_enabled, show_full_details=True)
+                    st.button(
+                        "⬅️ Back to table view",
+                        on_click=clear_inventory_selection_state,
+                        kwargs={"trigger_rerun": True},
+                        key="back_to_table",
+                    )
+            else:
+                st.caption("Tap a vehicle row to open a detailed card view.")
+                table_selection = st.session_state.get("inventory_table_selection", {"rows": []})
+                st.dataframe(
+                    filtered_reset[cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    selection_mode="single-row",
+                    on_select="rerun",
+                    selection=table_selection,
+                    key="inventory_table",
+                )
+
+                table_state = st.session_state.get("inventory_table")
+                selected_rows = []
+                if table_state is not None:
+                    selection_obj = getattr(table_state, "selection", None)
+                    if selection_obj is None and isinstance(table_state, dict):
+                        selection_obj = table_state.get("selection")
+                    if isinstance(selection_obj, dict):
+                        selected_rows = selection_obj.get("rows", []) or []
+
+                if selected_rows:
+                    selected_pos = selected_rows[0]
+                    if 0 <= selected_pos < len(filtered_reset):
+                        st.session_state["inventory_selected_row_position"] = selected_pos
+                        st.session_state["inventory_selected_vin"] = str(
+                            filtered_reset.iloc[selected_pos].get("VIN", "")
+                        )
+                        st.session_state["inventory_table_selection"] = {"rows": selected_rows}
+                        st.session_state["inventory_view_mode"] = "card"
+                        st.experimental_rerun()
+                else:
+                    st.session_state["inventory_table_selection"] = {"rows": []}
 
     st.divider()
     st.subheader("Best Match Comparison")
