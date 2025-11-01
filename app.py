@@ -710,6 +710,11 @@ inv = pd.DataFrame({
 inv["PriceNum"]   = inv["Price"].apply(to_num)
 inv["MileageNum"] = inv["Mileage"].apply(to_num)
 
+# Filter out vehicles that aren't yet priced for sale
+zero_price_mask = inv["PriceNum"].eq(0)
+if zero_price_mask.any():
+    inv = inv.loc[~zero_price_mask].copy()
+
 # ------------------ Merge Inventory + Carfax Cache ------------------
 if cf_df is None or cf_df.empty or "VIN" not in cf_df.columns:
     cf_df = pd.DataFrame(columns=["VIN"])
