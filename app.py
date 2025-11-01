@@ -86,11 +86,38 @@ def to_excel_bytes(df: pd.DataFrame) -> io.BytesIO:
     return bio
 
 def find_carfax_file(vin: str):
-    """Return absolute path to first PDF whose filename contains the VIN."""
-    if not vin: return None
-    for f in sorted(os.listdir(CARFAX_DIR)):
-        if vin in f:
-            return os.path.join(CARFAX_DIR, f)
+    """Return absolute path to Carfax PDF for a VIN, using parse index fallback."""
+
+    if not vin:
+        return None
+
+    vin = vin.upper().strip()
+
+    # Prefer direct filename match (covers files manually named with VIN)
+    for fname in sorted(os.listdir(CARFAX_DIR)):
+        if vin in fname.upper():
+            path = os.path.join(CARFAX_DIR, fname)
+            if os.path.isfile(path):
+                return path
+
+    # Fallback: look up by VIN in the parse index (handles renamed/hashed files)
+    matches = []
+    for fname, meta in carfax_parse_index.items():
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("vin", "")).upper() != vin:
+            continue
+        path = os.path.join(CARFAX_DIR, fname)
+        if not os.path.isfile(path):
+            continue
+        mtime = meta.get("mtime") or _safe_file_mtime(path) or 0
+        matches.append((mtime, path))
+
+    if matches:
+        # Return the most recently modified file for the VIN
+        matches.sort(key=lambda x: x[0], reverse=True)
+        return matches[0][1]
+
     return None
 
 # ------------------ PDF Parsing ------------------
