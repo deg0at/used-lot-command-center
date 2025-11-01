@@ -26,12 +26,13 @@ CARFAX_DIR = os.path.join(DATA_DIR, "carfaxes")
 LISTINGS_DIR = os.path.join(DATA_DIR, "listings")
 CARFAX_CACHE_PATH = os.path.join(DATA_DIR, "carfax_cache.json")
 STORY_CACHE_PATH  = os.path.join(DATA_DIR, "story_cache.json")
+CARFAX_PARSE_INDEX_PATH = os.path.join(DATA_DIR, "carfax_parse_index.json")
 
 # Ensure folders/files exist
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CARFAX_DIR, exist_ok=True)
 os.makedirs(LISTINGS_DIR, exist_ok=True)
-for fpath in [CARFAX_CACHE_PATH, STORY_CACHE_PATH]:
+for fpath in [CARFAX_CACHE_PATH, STORY_CACHE_PATH, CARFAX_PARSE_INDEX_PATH]:
     if not os.path.exists(fpath):
         with open(fpath, "w") as f: f.write("{}")
 
@@ -196,15 +197,42 @@ def parse_new_carfax_pdfs(progress_callback: Optional[Callable[[int, int, Option
     If a PDF already yields a cached VIN, skip.
     """
     existing_vins = set(carfax_cache.keys())
+    index_dirty = False
+
+    # Prune index entries for files that no longer exist
+    for fname in list(carfax_parse_index.keys()):
+        if not os.path.exists(os.path.join(CARFAX_DIR, fname)):
+            carfax_parse_index.pop(fname, None)
+            index_dirty = True
+    if index_dirty:
+        save_json(CARFAX_PARSE_INDEX_PATH, carfax_parse_index)
+        index_dirty = False
+
     pdfs = [f for f in os.listdir(CARFAX_DIR) if f.lower().endswith(".pdf")]
     total = len(pdfs)
     parsed_new = 0
     for idx, name in enumerate(sorted(pdfs), start=1):
         full = os.path.join(CARFAX_DIR, name)
 
+        # Skip re-parsing if file unchanged and VIN already cached
+        mtime = _safe_file_mtime(full)
+        idx_entry = carfax_parse_index.get(name)
+        if (
+            mtime is not None
+            and idx_entry
+            and idx_entry.get("mtime") == mtime
+            and idx_entry.get("vin") in carfax_cache
+        ):
+            existing_vins.add(idx_entry["vin"])
+            if progress_callback:
+                progress_callback(idx, total, name, parsed_new)
+            continue
+
         # If VIN in filename and already cached, skip
         m = VIN_RE.search(name.upper())
         if m and (m.group(1) in existing_vins):
+            if mtime is not None:
+                record_parsed_carfax(name, m.group(1), mtime)
             if progress_callback:
                 progress_callback(idx, total, name, parsed_new)
             continue
@@ -219,6 +247,11 @@ def parse_new_carfax_pdfs(progress_callback: Optional[Callable[[int, int, Option
                 upsert_carfax_cache(rec["VIN"], rec)
                 existing_vins.add(rec["VIN"])
                 parsed_new += 1
+                record_parsed_carfax(name, rec["VIN"], mtime)
+            elif rec and rec["VIN"] in carfax_cache:
+                # Ensure index knows about this file -> VIN link
+                existing_vins.add(rec["VIN"])
+                record_parsed_carfax(name, rec["VIN"], mtime)
         except FileNotFoundError:
             # File disappeared between listing and open
             pass
@@ -248,13 +281,37 @@ def carfax_cache_as_df() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ------------------ Cache upserts ------------------
-carfax_cache = load_json(CARFAX_CACHE_PATH)  # {VIN: parsed dict}
-story_cache  = load_json(STORY_CACHE_PATH)   # {VIN: story str}
+carfax_cache = load_json(CARFAX_CACHE_PATH)          # {VIN: parsed dict}
+story_cache  = load_json(STORY_CACHE_PATH)           # {VIN: story str}
+carfax_parse_index = load_json(CARFAX_PARSE_INDEX_PATH)  # {filename: {vin, mtime}}
+
+def _safe_file_mtime(path: str) -> Optional[float]:
+    try:
+        return round(os.path.getmtime(path), 6)
+    except (FileNotFoundError, OSError):
+        return None
 
 def upsert_carfax_cache(vin: str, rec: dict):
     rec = {**rec, "last_updated": datetime.now().isoformat(timespec="seconds")}
     carfax_cache[vin] = rec
     save_json(CARFAX_CACHE_PATH, carfax_cache)
+
+def record_parsed_carfax(filename: str, vin: str, mtime: Optional[float] = None):
+    if not filename or not vin:
+        return
+    base = os.path.basename(filename)
+    if mtime is None:
+        mtime = _safe_file_mtime(os.path.join(CARFAX_DIR, base))
+    if mtime is None:
+        return
+    existing = carfax_parse_index.get(base, {})
+    if existing.get("vin") == vin and existing.get("mtime") == mtime:
+        return
+    carfax_parse_index[base] = {
+        "vin": vin,
+        "mtime": mtime,
+    }
+    save_json(CARFAX_PARSE_INDEX_PATH, carfax_parse_index)
 
 def upsert_story_cache(vin: str, story: str):
     story_cache[vin] = story
