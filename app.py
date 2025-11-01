@@ -1,9 +1,9 @@
 # ==============================================================
-# Used Lot Command Center — Hybrid AI Edition (v11)
+# Used Lot Car Finder — Inventory Insights (v12)
 # - Persistent storage (listings, carfaxes, caches)
 # - Auto-parse only new Carfax PDFs; cached forever
 # - Per-VIN AI story buttons (cached)
-# - GPT-powered AI Search (fallback parser if no key)
+# - Guided vehicle finder with card/table views
 # - Safe/NaN-proof scoring + summaries + owner ratings
 # ==============================================================
 
@@ -17,8 +17,8 @@ import streamlit as st
 from pypdf import PdfReader
 
 # ------------------ App Config ------------------
-st.set_page_config(page_title="Used Lot Command Center — Hybrid AI", layout="wide")
-st.title("🚗 Used Lot Command Center — Hybrid AI")
+st.set_page_config(page_title="Used Lot Car Finder", layout="wide")
+st.title("🚗 Used Lot Car Finder")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -485,53 +485,6 @@ def summarize_carfax(row: pd.Series):
 
 
 # ------------------ AI helpers ------------------
-def ai_interpret_query(prompt: str) -> dict:
-    """Natural query -> filters. Falls back to rule engine if API unavailable."""
-    def fallback_rules(q: str) -> dict:
-        q = q.lower()
-        filters = {}
-        if "suv" in q: filters["Body"] = "SUV"
-        if "truck" in q: filters["Body"] = "Truck"
-        if "sedan" in q: filters["Body"] = "Sedan"
-        if "coupe" in q: filters["Body"] = "Coupe"
-        if "van" in q: filters["Body"] = "Van"
-        if "awd" in q or "4wd" in q: filters["DriveTrain"] = "AWD"
-        if "fwd" in q: filters["DriveTrain"] = "FWD"
-        if "rwd" in q: filters["DriveTrain"] = "RWD"
-        m = re.search(r"under\s*\$?(\d[\d,]*)", q)
-        if m: filters["PriceMax"] = float(m.group(1).replace(",",""))
-        m = re.search(r"over\s*\$?(\d[\d,]*)", q)
-        if m: filters["PriceMin"] = float(m.group(1).replace(",",""))
-        m = re.search(r"under\s*(\d[\d,]*)\s*miles?", q)
-        if m: filters["MileageMax"] = float(m.group(1).replace(",",""))
-        m = re.search(r"(\d{4})\s*to\s*(\d{4})", q)
-        if m: filters["YearMin"], filters["YearMax"] = int(m.group(1)), int(m.group(2))
-        return filters
-
-    if not (AI_AVAILABLE and openai):
-        return fallback_rules(prompt)
-
-    try:
-        system = "You are a car search interpreter. Output ONLY a compact JSON object of filters."
-        user = (
-            "Parse this free-text query into filters for inventory. Allowed keys: "
-            "Body, Make, Model, DriveTrain, PriceMax, PriceMin, MileageMax, MileageMin, YearMin, YearMax. "
-            "Return JSON only, no prose.\n"
-            f"Query: {prompt}"
-        )
-        resp = openai.ChatCompletion.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=0.1,
-        )
-        txt = resp["choices"][0]["message"]["content"]
-        try:
-            return json.loads(txt)
-        except Exception:
-            return fallback_rules(prompt)
-    except Exception:
-        return fallback_rules(prompt)
-
 def ai_talk_track(row: pd.Series) -> str:
     """Short persuasive talk track; template fallback."""
     base = f"{row.get('Year','')} {row.get('Make','')} {row.get('Model','')} {row.get('Trim') or ''}".strip()
@@ -688,7 +641,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### AI Settings")
-    st.caption("AI Search & AI Stories require an OpenAI API key in .streamlit/secrets.toml")
+    st.caption("AI stories and talk tracks require an OpenAI API key in .streamlit/secrets.toml")
     ai_enabled = AI_AVAILABLE and (openai is not None)
     st.write(f"AI features enabled: **{'Yes' if ai_enabled else 'No'}**")
 
@@ -943,8 +896,8 @@ data = data.loc[active_mask].copy()
 ss["data_df"] = data.copy()
 
 # ------------------ TABS ------------------
-tab_overview, tab_ai, tab_alerts = st.tabs(
-    ["📊 Overview", "🧠 AI Search", "⚠ Alerts"]
+tab_overview, tab_finder, tab_alerts = st.tabs(
+    ["📊 Overview", "🔎 Vehicle Finder", "⚠ Alerts"]
 )
 
 # ========== Overview ==========
@@ -968,6 +921,20 @@ with tab_overview:
     cols = [c for c in cols if c in data.columns]
     st.dataframe(data[cols], use_container_width=True, hide_index=True)
 
+    if not data.empty:
+        st.divider()
+        st.subheader("Top 10 Best Vehicles")
+        top_cols = [
+            "VIN","Year","Make","Model","Trim","Body","Price","Mileage","Score","SafetyScore","CarfaxQualityScore","ValueCategory"
+        ]
+        top_cols = [c for c in top_cols if c in data.columns]
+        top_sort_cols = [c for c in ["Score", "CarfaxQualityScore"] if c in data.columns]
+        if top_sort_cols:
+            top10 = data.sort_values(top_sort_cols, ascending=[False] * len(top_sort_cols)).head(10)
+        else:
+            top10 = data.head(10)
+        st.dataframe(top10[top_cols], use_container_width=True, hide_index=True)
+
     pending_ro_df = ss.get("pending_ro_df")
     if isinstance(pending_ro_df, pd.DataFrame) and not pending_ro_df.empty:
         st.divider()
@@ -976,72 +943,92 @@ with tab_overview:
         pending_cols = [c for c in cols if c in pending_ro_df.columns]
         st.dataframe(pending_ro_df[pending_cols], use_container_width=True, hide_index=True)
 
-# ========== AI Search ==========
-with tab_ai:
+# ========== Vehicle Finder ==========
+with tab_finder:
     data = ss["data_df"].copy()
-    st.subheader("Natural Language Search & Cards")
-    st.caption("Tip: add your OpenAI key in .streamlit/secrets.toml for best results.")
+    st.subheader("Vehicle Finder")
+    st.caption("Use the filters below to quickly zero-in on the right inventory by make, model, and vehicle type.")
 
-    query_text = st.text_input("Try: 'SUV under 25k with AWD and under 40k miles (2018 to 2022)'")
-    fc1, fc2, fc3, fc4 = st.columns(4)
-    sc_min, sc_max = fc1.slider("Smart Score", 0, 100, (70, 100))
-    safety_cut = fc2.slider("Min Safety", 0, 100, 70)
-    make_sel   = fc3.multiselect("Make", sorted(list(data["Make"].dropna().unique())))
-    val_sel    = fc4.multiselect("Value Category", ["Under Market","At Market","Over Market"])
+    make_options = sorted(data["Make"].dropna().unique()) if "Make" in data.columns else []
+    body_options = sorted(data["Body"].dropna().unique()) if "Body" in data.columns else []
+
+    fc1, fc2, fc3 = st.columns(3)
+    selected_make = fc1.selectbox("Make", ["All"] + make_options)
+
+    if selected_make != "All" and "Model" in data.columns:
+        model_candidates = data.loc[data["Make"] == selected_make, "Model"].dropna().unique()
+    elif "Model" in data.columns:
+        model_candidates = data["Model"].dropna().unique()
+    else:
+        model_candidates = []
+    model_options = sorted(model_candidates)
+    selected_model = fc2.selectbox("Model", ["All"] + model_options)
+
+    selected_body = fc3.selectbox("Vehicle Type", ["All"] + body_options)
+
+    sc_col, safety_col, price_col = st.columns(3)
+    sc_min, sc_max = sc_col.slider("Smart Score Range", 0, 100, (70, 100))
+    min_safety = safety_col.slider("Minimum Safety Score", 0, 100, 70)
+
+    if "PriceNum" in data.columns and data["PriceNum"].notna().any():
+        price_min = int(np.floor(data["PriceNum"].dropna().min() / 1000) * 1000)
+        price_max = int(np.ceil(data["PriceNum"].dropna().max() / 1000) * 1000)
+        if price_min == price_max:
+            selected_price = (price_min, price_max)
+            price_col.caption(f"All vehicles currently priced at ${price_min:,.0f}.")
+        else:
+            selected_price = price_col.slider(
+                "Price Range",
+                price_min,
+                price_max,
+                (price_min, price_max),
+                step=500
+            )
+    else:
+        selected_price = (None, None)
+        price_col.caption("No price data available in this inventory upload.")
+
+    view_as_cards = st.toggle("Card View", value=True)
 
     mask = pd.Series(True, index=data.index)
     mask &= data["Score"].between(sc_min, sc_max)
-    mask &= data["SafetyScore"] >= safety_cut
-    if make_sel: mask &= data["Make"].isin(make_sel)
-    if val_sel:  mask &= data["ValueCategory"].isin(val_sel)
-
-    # AI or fallback interpretation
-    if query_text.strip():
-        filters = ai_interpret_query(query_text)
-        st.caption(f"🧠 Filters: {filters}")
-        if "Body" in filters and "Body" in data.columns:
-            mask &= data["Body"].astype(str).str.contains(filters["Body"], case=False, na=False)
-        if "DriveTrain" in filters and "Drive Train" in data.columns:
-            mask &= data["Drive Train"].astype(str).str.contains(filters["DriveTrain"], case=False, na=False)
-        if "Make" in filters and "Make" in data.columns:
-            mask &= data["Make"].astype(str).str.contains(filters["Make"], case=False, na=False)
-        if "Model" in filters and "Model" in data.columns:
-            mask &= data["Model"].astype(str).str.contains(filters["Model"], case=False, na=False)
-        if "PriceMax" in filters and "PriceNum" in data.columns:
-            mask &= data["PriceNum"] <= filters["PriceMax"]
-        if "PriceMin" in filters and "PriceNum" in data.columns:
-            mask &= data["PriceNum"] >= filters["PriceMin"]
-        if "MileageMax" in filters and "MileageNum" in data.columns:
-            mask &= data["MileageNum"] <= filters["MileageMax"]
-        if "MileageMin" in filters and "MileageNum" in data.columns:
-            mask &= data["MileageNum"] >= filters["MileageMin"]
-        if "YearMin" in filters and "Year" in data.columns:
-            mask &= pd.to_numeric(data["Year"], errors="coerce") >= filters["YearMin"]
-        if "YearMax" in filters and "Year" in data.columns:
-            mask &= pd.to_numeric(data["Year"], errors="coerce") <= filters["YearMax"]
+    mask &= data["SafetyScore"] >= min_safety
+    if selected_make != "All" and "Make" in data.columns:
+        mask &= data["Make"] == selected_make
+    if selected_model != "All" and "Model" in data.columns:
+        mask &= data["Model"] == selected_model
+    if selected_body != "All" and "Body" in data.columns:
+        mask &= data["Body"] == selected_body
+    if selected_price[0] is not None and selected_price[1] is not None and "PriceNum" in data.columns:
+        mask &= data["PriceNum"].between(selected_price[0], selected_price[1])
 
     filtered = data.loc[mask].copy()
+    sort_cols = [c for c in ["Score", "CarfaxQualityScore"] if c in filtered.columns]
+    if sort_cols:
+        filtered.sort_values(sort_cols, ascending=[False] * len(sort_cols), inplace=True)
+
     st.divider()
-    st.subheader(f"Results ({len(filtered)})")
-    view_as_cards = st.toggle("Card View", value=True)
+    st.subheader(f"Matching Vehicles ({len(filtered)})")
 
     if filtered.empty:
-        st.warning("No vehicles match your filters.")
+        st.warning("No vehicles match the selected filters. Try widening your range or clearing filters.")
     else:
         if view_as_cards:
             for _, r in filtered.head(120).iterrows():
                 with st.container(border=True):
-                    c1, c2, c3 = st.columns([2,1,2])
+                    c1, c2, c3 = st.columns([2, 1, 2])
 
-                    # LEFT: Title + Summary + Files + AI story button
                     with c1:
-                        yr = int(r['Year']) if pd.notna(r['Year']) else ''
+                        year_val = r.get('Year')
+                        try:
+                            yr = int(float(year_val)) if pd.notna(year_val) else ''
+                        except (TypeError, ValueError):
+                            yr = ''
                         title = f"{yr} {r.get('Make','')} {r.get('Model','')} {r.get('Trim') or ''}".strip()
                         st.markdown(f"**{title}**")
                         st.markdown(f"<div style='font-size:1.1rem'><b>${r.get('Price')}</b></div>", unsafe_allow_html=True)
                         st.caption(f"{r.get('Body','') or ''} • {r.get('Mileage')} mi • {r.get('Drive Train') or ''}")
 
-                        # Carfax summary & story label
                         summary = summarize_carfax(r)
                         svc_interval = r.get("AvgServiceInterval")
                         svc_info = ""
@@ -1055,12 +1042,10 @@ with tab_ai:
                         st.markdown(f"_{summary}{svc_info}{major_info}_")
                         st.caption(f"**Vehicle Story: {r.get('StoryLabel','?')} ({int(r.get('StoryScore',0))}/100)**")
 
-                        # Owner ratings (if any)
                         if isinstance(r.get("OwnerRatings"), list) and r["OwnerRatings"]:
                             owners_summary = " • ".join([f"Owner {o['Owner']}: {o['Score']}/100" for o in r["OwnerRatings"]])
                             st.caption(f"Owner Ratings: {owners_summary}")
 
-                        # Carfax file/link access
                         carfax_link = clean_carfax_link(r.get("CarfaxLink", ""))
                         cf_path = find_carfax_file(r['VIN'])
                         pdf_bytes = None
@@ -1101,20 +1086,17 @@ with tab_ai:
                         if not carfax_link and not pdf_bytes:
                             st.caption("No Carfax file found for this VIN.")
 
-                        # Per-VIN AI Story button
                         if st.button(f"🧠 Generate Story for {r['VIN']}", key=f"story_{r['VIN']}"):
                             with st.spinner("Generating story..." if ai_enabled else "Loading cached/fallback story..."):
                                 story = ai_vehicle_story(r["VIN"], r.get("CarfaxText","") or "")
                             st.write(f"**AI Story:** {story}")
 
-                    # MIDDLE: Key metrics
                     with c2:
                         st.metric("Smart", f"{r['Score']:.0f}")
                         st.metric("Safety", f"{r['SafetyScore']:.0f}")
                         st.metric("Carfax", f"{int(r['CarfaxQualityScore'])}/100")
                         st.metric("Value", r.get("ValueCategory","—"))
 
-                    # RIGHT: Talk track
                     with c3:
                         tt = ai_talk_track(r) if ai_enabled else ""
                         if tt:
@@ -1131,6 +1113,58 @@ with tab_ai:
             ]
             cols = [c for c in cols if c in filtered.columns]
             st.dataframe(filtered[cols], use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Best Match Comparison")
+
+    comparison_pool = filtered.copy()
+    best_pair = None
+    best_pair_key = None
+
+    if not comparison_pool.empty:
+        if {"Make", "Model"}.issubset(comparison_pool.columns):
+            grouped = comparison_pool.groupby(["Make", "Model"])
+            best_avg = -np.inf
+            for key, grp in grouped:
+                if len(grp) < 2:
+                    continue
+                top_two = grp.sort_values("Score", ascending=False).head(2)
+                avg_score = top_two["Score"].mean()
+                if avg_score > best_avg:
+                    best_avg = avg_score
+                    best_pair = top_two
+                    best_pair_key = key
+        if best_pair is None and len(comparison_pool) >= 2:
+            sort_cols = [c for c in ["Score", "CarfaxQualityScore"] if c in comparison_pool.columns]
+            if sort_cols:
+                best_pair = comparison_pool.sort_values(sort_cols, ascending=[False] * len(sort_cols)).head(2)
+            else:
+                best_pair = comparison_pool.head(2)
+
+    if best_pair is None or len(best_pair) < 2:
+        st.info("Pick a make/model with at least two vehicles to see an automatic side-by-side comparison.")
+    else:
+        if best_pair_key:
+            mk, mdl = best_pair_key
+            st.caption(f"Top performers for {mk} {mdl} based on Smart Score.")
+        cols = st.columns(2)
+        for col, (_, row) in zip(cols, best_pair.iterrows()):
+            with col:
+                year_val = row.get('Year')
+                if pd.notna(year_val):
+                    try:
+                        year_text = f"{int(float(year_val))} "
+                    except (TypeError, ValueError):
+                        year_text = ""
+                else:
+                    year_text = ""
+                title_text = f"{year_text}{row.get('Make','')} {row.get('Model','')}".strip()
+                st.markdown(f"### {title_text}")
+                st.metric("Smart Score", f"{row['Score']:.0f}")
+                st.metric("Safety Score", f"{row['SafetyScore']:.0f}")
+                st.metric("Price", row.get("Price", "—"))
+                st.metric("Mileage", row.get("Mileage", "—"))
+                st.caption(summarize_carfax(row))
 
     st.divider()
     cA, cB = st.columns(2)
