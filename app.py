@@ -8,6 +8,7 @@
 # ==============================================================
 
 import io, os, re, json, zipfile, traceback
+from typing import Callable, Optional, Tuple
 from datetime import datetime
 
 import numpy as np
@@ -189,20 +190,23 @@ def parse_carfax(lines, fname=""):
         "CarfaxText": snippet
     }
 
-def parse_new_carfax_pdfs():
+def parse_new_carfax_pdfs(progress_callback: Optional[Callable[[int, int, Optional[str], int], None]] = None):
     """
     Parse only Carfax PDFs that produce a VIN not already in cache.
     If a PDF already yields a cached VIN, skip.
     """
     existing_vins = set(carfax_cache.keys())
     pdfs = [f for f in os.listdir(CARFAX_DIR) if f.lower().endswith(".pdf")]
+    total = len(pdfs)
     parsed_new = 0
-    for name in sorted(pdfs):
+    for idx, name in enumerate(sorted(pdfs), start=1):
         full = os.path.join(CARFAX_DIR, name)
 
         # If VIN in filename and already cached, skip
         m = VIN_RE.search(name.upper())
         if m and (m.group(1) in existing_vins):
+            if progress_callback:
+                progress_callback(idx, total, name, parsed_new)
             continue
 
         # Parse PDF
@@ -215,9 +219,17 @@ def parse_new_carfax_pdfs():
                 upsert_carfax_cache(rec["VIN"], rec)
                 existing_vins.add(rec["VIN"])
                 parsed_new += 1
+        except FileNotFoundError:
+            # File disappeared between listing and open
+            pass
         except Exception:
             # Continue on errors; keep robust
             continue
+        finally:
+            if progress_callback:
+                progress_callback(idx, total, name, parsed_new)
+    if progress_callback:
+        progress_callback(total, total, None, parsed_new)
     return parsed_new
 
 def carfax_cache_as_df() -> pd.DataFrame:
@@ -484,35 +496,63 @@ def save_uploaded_inventory(file) -> str:
         f.write(raw)
     return out
 
-def save_uploaded_carfax_zip(file) -> int:
+def _normalize_carfax_name(name: str) -> str:
+    base = os.path.basename(name)
+    if "__" in base:
+        return base.split("__", 1)[1]
+    return base
+
+def _existing_carfax_basenames() -> set:
+    existing = set()
+    try:
+        for fname in os.listdir(CARFAX_DIR):
+            existing.add(_normalize_carfax_name(fname))
+    except Exception:
+        pass
+    return existing
+
+def save_uploaded_carfax_zip(file) -> Tuple[int, int]:
     added = 0
+    skipped = 0
+    existing = _existing_carfax_basenames()
     file_bytes = io.BytesIO(file.getvalue())
     if hasattr(file, "seek"):
         file.seek(0)
     with zipfile.ZipFile(file_bytes) as z:
         for name in z.namelist():
             if name.lower().endswith(".pdf"):
+                base = _normalize_carfax_name(os.path.basename(name))
+                if base in existing:
+                    skipped += 1
+                    continue
                 raw = z.read(name)
-                base = os.path.basename(name)
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 out = os.path.join(CARFAX_DIR, f"{stamp}__{base}")
                 with open(out, "wb") as f:
                     f.write(raw)
                 added += 1
-    return added
+                existing.add(base)
+    return added, skipped
 
-def save_uploaded_carfax_pdfs(files) -> int:
+def save_uploaded_carfax_pdfs(files) -> Tuple[int, int]:
     added = 0
+    skipped = 0
+    existing = _existing_carfax_basenames()
     for file in files:
+        base = _normalize_carfax_name(file.name)
+        if base in existing:
+            skipped += 1
+            continue
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = os.path.join(CARFAX_DIR, f"{stamp}__{file.name}")
+        out = os.path.join(CARFAX_DIR, f"{stamp}__{base}")
         raw = file.getvalue()
         if hasattr(file, "seek"):
             file.seek(0)
         with open(out, "wb") as f:
             f.write(raw)
         added += 1
-    return added
+        existing.add(base)
+    return added, skipped
 
 # ------------------ Session ------------------
 ss = st.session_state
@@ -548,21 +588,28 @@ if reset_btn:
 
 # Save uploads immediately (persistent)
 added_pdfs = 0
+skipped_duplicates = 0
 if inv_upload is not None:
     ss["inv_path"] = save_uploaded_inventory(inv_upload)
     st.sidebar.success(f"Inventory saved to {ss['inv_path']}")
 
 if cf_zip_upload is not None:
     try:
-        added_pdfs += save_uploaded_carfax_zip(cf_zip_upload)
+        added, skipped = save_uploaded_carfax_zip(cf_zip_upload)
+        added_pdfs += added
+        skipped_duplicates += skipped
     except zipfile.BadZipFile:
         st.sidebar.error("The uploaded file is not a valid ZIP. Please re-save and upload again.")
 
 if cf_pdf_uploads:
-    added_pdfs += save_uploaded_carfax_pdfs(cf_pdf_uploads)
+    added, skipped = save_uploaded_carfax_pdfs(cf_pdf_uploads)
+    added_pdfs += added
+    skipped_duplicates += skipped
 
 if added_pdfs:
     st.sidebar.success(f"Saved {added_pdfs} Carfax PDF(s) into {CARFAX_DIR}")
+if skipped_duplicates:
+    st.sidebar.info(f"Skipped {skipped_duplicates} duplicate Carfax PDF filename(s).")
 
 # ------------------ Auto-Load & Parse ------------------
 # 1) Choose inventory file (latest if none uploaded)
@@ -579,8 +626,36 @@ if inv_path is None or not os.path.exists(inv_path):
     st.stop()
 
 # 2) Auto-parse any new Carfax PDFs (once)
+progress_placeholder = st.sidebar.empty()
+status_placeholder = st.sidebar.empty()
+
+def _update_carfax_progress(current: int, total: int, filename: Optional[str], parsed_new: int):
+    if total == 0:
+        progress_placeholder.empty()
+        if filename is None and current == 0:
+            status_placeholder.info("No Carfax PDFs found to parse.")
+        return
+
+    percent = int((current / total) * 100)
+    if filename is not None:
+        progress_placeholder.progress(
+            percent,
+            text=f"Parsing Carfax PDFs… {current}/{total}"
+        )
+        status_placeholder.info(
+            f"Processing {os.path.basename(filename)} — {parsed_new} new parsed so far."
+        )
+    else:
+        progress_placeholder.empty()
+        if parsed_new:
+            status_placeholder.success(
+                f"Finished parsing Carfax PDFs. Added {parsed_new} new report{'s' if parsed_new != 1 else ''}."
+            )
+        else:
+            status_placeholder.info("Finished parsing Carfax PDFs. No new reports detected.")
+
 if process_btn or added_pdfs or True:
-    new_count = parse_new_carfax_pdfs()
+    new_count = parse_new_carfax_pdfs(progress_callback=_update_carfax_progress)
     if new_count:
         st.info(f"Parsed {new_count} new Carfax PDF(s) and updated cache.")
 
