@@ -811,6 +811,9 @@ else:
     pending_ro_mask = pd.Series(False, index=data.index)
     pending_deal_mask = pd.Series(False, index=data.index)
 
+data["pend. RO"] = np.where(pending_ro_mask, 1, 0)
+data["pend. deal"] = np.where(pending_deal_mask, 1, 0)
+
 ss["pending_ro_df"] = data.loc[pending_ro_mask].copy()
 ss["pending_deal_df"] = data.loc[pending_deal_mask].copy()
 
@@ -841,7 +844,7 @@ with tab_overview:
         "Mileage","Price","KBBValue","ValueCategory",
         "AccidentSeverity","OwnerCount","ServiceEvents","MajorParts",
         "CarfaxQualityLabel","CarfaxQualityScore","StoryLabel","StoryScore",
-        "SafetyScore","Score","Days","Status"
+        "SafetyScore","Score","Days","Status","pend. RO","pend. deal"
     ]
     cols = [c for c in cols if c in data.columns]
     st.dataframe(data[cols], use_container_width=True, hide_index=True)
