@@ -7,7 +7,7 @@
 # - Safe/NaN-proof scoring + summaries + owner ratings
 # ==============================================================
 
-import io, os, re, json, zipfile, traceback
+import io, os, re, json, zipfile, traceback, base64
 from typing import Callable, Optional, Tuple
 from datetime import datetime
 
@@ -945,7 +945,20 @@ with tab_ai:
                         cf_path = find_carfax_file(r['VIN'])
                         if cf_path and os.path.exists(cf_path):
                             with open(cf_path, "rb") as f:
-                                st.download_button("📄 Download Carfax PDF", f.read(), file_name=os.path.basename(cf_path), mime="application/pdf", key=f"dl_{r['VIN']}")
+                                pdf_bytes = f.read()
+                            st.download_button(
+                                "📄 Download Carfax PDF",
+                                pdf_bytes,
+                                file_name=os.path.basename(cf_path),
+                                mime="application/pdf",
+                                key=f"dl_{r['VIN']}"
+                            )
+
+                            carfax_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+                            st.markdown(
+                                f"<a href='data:application/pdf;base64,{carfax_b64}' target='_blank'>🔍 View Carfax</a>",
+                                unsafe_allow_html=True,
+                            )
                         else:
                             st.caption("No Carfax file found for this VIN.")
 
