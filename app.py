@@ -810,8 +810,19 @@ try:
         st.success(f"✅ Loaded CSV: {os.path.basename(inv_path)}")
     elif ext in (".xls", ".xlsx"):
         engine = "openpyxl" if ext == ".xlsx" else "xlrd"
-        raw = pd.read_excel(inv_path, engine=engine)
-        st.success(f"✅ Loaded Excel: {os.path.basename(inv_path)}")
+        try:
+            raw = pd.read_excel(inv_path, engine=engine)
+        except (zipfile.BadZipFile, ValueError) as exc:
+            try:
+                raw = pd.read_csv(inv_path)
+            except Exception as csv_exc:
+                raise csv_exc from exc
+            st.warning(
+                f"⚠️ Excel file appeared corrupted or mis-labeled ({exc}); loaded as CSV instead."
+            )
+            st.success(f"✅ Loaded CSV fallback: {os.path.basename(inv_path)}")
+        else:
+            st.success(f"✅ Loaded Excel: {os.path.basename(inv_path)}")
     else:
         try:
             raw = pd.read_csv(inv_path)
