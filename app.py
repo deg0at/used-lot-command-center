@@ -802,6 +802,21 @@ data["ValueCategory"] = np.where(
 )
 data["SalesMood"] = np.where(data["Score"]>=85,"🟢 Confident","🟡 Balanced")
 
+# Separate pending statuses from active inventory
+if "Status" in data.columns:
+    status_norm = data["Status"].astype(str).str.strip()
+    pending_ro_mask = status_norm.str.contains("pending ro", case=False, na=False)
+    pending_deal_mask = status_norm.str.contains("pending deal", case=False, na=False)
+else:
+    pending_ro_mask = pd.Series(False, index=data.index)
+    pending_deal_mask = pd.Series(False, index=data.index)
+
+ss["pending_ro_df"] = data.loc[pending_ro_mask].copy()
+ss["pending_deal_df"] = data.loc[pending_deal_mask].copy()
+
+active_mask = ~(pending_ro_mask | pending_deal_mask)
+data = data.loc[active_mask].copy()
+
 # Save to session
 ss["data_df"] = data.copy()
 
@@ -830,6 +845,14 @@ with tab_overview:
     ]
     cols = [c for c in cols if c in data.columns]
     st.dataframe(data[cols], use_container_width=True, hide_index=True)
+
+    pending_ro_df = ss.get("pending_ro_df")
+    if isinstance(pending_ro_df, pd.DataFrame) and not pending_ro_df.empty:
+        st.divider()
+        st.subheader("Pending RO Vehicles")
+        st.caption("These vehicles are awaiting reconditioning orders and are excluded from the active inventory above.")
+        pending_cols = [c for c in cols if c in pending_ro_df.columns]
+        st.dataframe(pending_ro_df[pending_cols], use_container_width=True, hide_index=True)
 
 # ========== AI Search ==========
 with tab_ai:
