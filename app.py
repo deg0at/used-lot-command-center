@@ -37,6 +37,38 @@ for fpath in [CARFAX_CACHE_PATH, STORY_CACHE_PATH, CARFAX_PARSE_INDEX_PATH]:
         with open(fpath, "w") as f: f.write("{}")
 
 VIN_RE = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
+URL_RE = re.compile(r"https?://[^\s\"'>)]+", re.IGNORECASE)
+
+
+def extract_first_url(value: str) -> Optional[str]:
+    """Return the first HTTP(S) URL found within *value*, if any."""
+
+    if not value:
+        return None
+
+    if isinstance(value, str):
+        txt = value.strip()
+    else:
+        txt = str(value).strip()
+
+    if not txt or txt.lower() in {"nan", "none", "null"}:
+        return None
+
+    if txt.lower().startswith(("http://", "https://")):
+        return txt
+
+    match = URL_RE.search(txt)
+    if match:
+        return match.group(0)
+
+    return None
+
+
+def clean_carfax_link(value) -> str:
+    """Normalize any Carfax link value into a direct URL or empty string."""
+
+    link = extract_first_url(value)
+    return link or ""
 
 # ------------------ OpenAI (optional) ------------------
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
@@ -797,6 +829,26 @@ if not vin_col:
     st.error("No VIN column found in inventory.")
     st.stop()
 
+# Identify potential Carfax link column (varied vendor exports use different labels)
+carfax_candidate_names = [
+    "CarfaxLink", "Carfax Link", "CarFaxLink", "CarFax Link",
+    "CarfaxURL", "CarFaxURL", "Carfax Url", "CarFax Url",
+    "Vehicle History", "VehicleHistory", "Vehicle History Report",
+    "VehicleHistoryReport", "History Report", "HistoryReport",
+    "VehicleHistoryURL", "Vehicle History URL", "Carfax Report", "CarfaxReport",
+]
+carfax_link_col = next((c for c in carfax_candidate_names if c in raw.columns), None)
+if not carfax_link_col:
+    carfax_link_col = next(
+        (
+            c
+            for c in raw.columns
+            if "carfax" in c.lower()
+            and any(k in c.lower() for k in ("link", "url", "report", "history"))
+        ),
+        None,
+    )
+
 # Normalize inventory columns
 inv = pd.DataFrame({
     "VIN": raw[vin_col].astype(str).str.upper().str.strip(),
@@ -813,6 +865,7 @@ inv = pd.DataFrame({
     "CPO": raw.get("CPO"),
     "Warranty": (raw.get("Warr.") if "Warr." in raw.columns else raw.get("Warranty")),
     "Status": raw.get("Status"),
+    "CarfaxLink": (raw[carfax_link_col].apply(clean_carfax_link) if carfax_link_col else ""),
 })
 
 inv["PriceNum"]   = inv["Price"].apply(to_num)
@@ -829,6 +882,9 @@ if cf_df is None or cf_df.empty or "VIN" not in cf_df.columns:
 
 data = inv.merge(cf_df, on="VIN", how="left")
 data["CarfaxUploaded"] = data["VIN"].isin(cf_df["VIN"]) if not cf_df.empty else False
+if "CarfaxLink" in data.columns:
+    has_carfax_link = data["CarfaxLink"].astype(str).str.contains(r"^https?://", case=False, regex=True, na=False)
+    data["CarfaxUploaded"] = data["CarfaxUploaded"].fillna(False) | has_carfax_link
 
 # Derived metrics
 data["AvgServiceInterval"] = data.apply(estimate_service_interval, axis=1)
@@ -993,12 +1049,25 @@ with tab_ai:
                             owners_summary = " • ".join([f"Owner {o['Owner']}: {o['Score']}/100" for o in r["OwnerRatings"]])
                             st.caption(f"Owner Ratings: {owners_summary}")
 
-                        # Carfax file access
+                        # Carfax file/link access
+                        carfax_link = clean_carfax_link(r.get("CarfaxLink", ""))
                         cf_path = find_carfax_file(r['VIN'])
+                        pdf_bytes = None
+
                         if cf_path and os.path.exists(cf_path):
                             with open(cf_path, "rb") as f:
                                 pdf_bytes = f.read()
 
+                        if carfax_link:
+                            st.markdown(
+                                (
+                                    "<a style='display:inline-block;margin-bottom:0.5rem;padding:0.35rem 0.75rem;"
+                                    "background-color:#1f77b4;color:white;border-radius:4px;text-decoration:none;'"
+                                    f" href='{carfax_link}' target='_blank'>🔍 View Carfax</a>"
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                        elif pdf_bytes:
                             carfax_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
                             st.markdown(
                                 (
@@ -1009,6 +1078,7 @@ with tab_ai:
                                 unsafe_allow_html=True,
                             )
 
+                        if pdf_bytes:
                             st.download_button(
                                 "📄 Download Carfax PDF",
                                 pdf_bytes,
@@ -1016,7 +1086,8 @@ with tab_ai:
                                 mime="application/pdf",
                                 key=f"dl_{r['VIN']}"
                             )
-                        else:
+
+                        if not carfax_link and not pdf_bytes:
                             st.caption("No Carfax file found for this VIN.")
 
                         # Per-VIN AI Story button
