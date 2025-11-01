@@ -19,13 +19,15 @@ from pypdf import PdfReader
 st.set_page_config(page_title="Used Lot Command Center — Hybrid AI", layout="wide")
 st.title("🚗 Used Lot Command Center — Hybrid AI")
 
-DATA_DIR = "data"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 CARFAX_DIR = os.path.join(DATA_DIR, "carfaxes")
 LISTINGS_DIR = os.path.join(DATA_DIR, "listings")
 CARFAX_CACHE_PATH = os.path.join(DATA_DIR, "carfax_cache.json")
 STORY_CACHE_PATH  = os.path.join(DATA_DIR, "story_cache.json")
 
 # Ensure folders/files exist
+os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(CARFAX_DIR, exist_ok=True)
 os.makedirs(LISTINGS_DIR, exist_ok=True)
 for fpath in [CARFAX_CACHE_PATH, STORY_CACHE_PATH]:
@@ -475,13 +477,19 @@ def save_uploaded_inventory(file) -> str:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base = file.name
     out = os.path.join(LISTINGS_DIR, f"{stamp}__{base}")
+    raw = file.getvalue()
+    if hasattr(file, "seek"):
+        file.seek(0)
     with open(out, "wb") as f:
-        f.write(file.getbuffer())
+        f.write(raw)
     return out
 
 def save_uploaded_carfax_zip(file) -> int:
     added = 0
-    with zipfile.ZipFile(file) as z:
+    file_bytes = io.BytesIO(file.getvalue())
+    if hasattr(file, "seek"):
+        file.seek(0)
+    with zipfile.ZipFile(file_bytes) as z:
         for name in z.namelist():
             if name.lower().endswith(".pdf"):
                 raw = z.read(name)
@@ -498,8 +506,11 @@ def save_uploaded_carfax_pdfs(files) -> int:
     for file in files:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out = os.path.join(CARFAX_DIR, f"{stamp}__{file.name}")
+        raw = file.getvalue()
+        if hasattr(file, "seek"):
+            file.seek(0)
         with open(out, "wb") as f:
-            f.write(file.getbuffer())
+            f.write(raw)
         added += 1
     return added
 
@@ -751,12 +762,12 @@ with tab_ai:
                         # Carfax summary & story label
                         summary = summarize_carfax(r)
                         svc_interval = r.get("AvgServiceInterval")
-svc_info = ""
-try:
-    if svc_interval and not pd.isna(svc_interval):
-        svc_info = f" • Avg service every ~{int(float(svc_interval)):,} mi"
-except Exception:
-    svc_info = ""
+                        svc_info = ""
+                        try:
+                            if svc_interval and not pd.isna(svc_interval):
+                                svc_info = f" • Avg service every ~{int(float(svc_interval)):,} mi"
+                        except Exception:
+                            svc_info = ""
                         major_parts = r.get("MajorParts", "None")
                         major_info = f" • Major parts replaced: {major_parts}" if isinstance(major_parts, str) and major_parts and major_parts != "None" else ""
                         st.markdown(f"_{summary}{svc_info}{major_info}_")
