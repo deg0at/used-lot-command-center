@@ -829,8 +829,9 @@ data["SalesMood"] = np.where(data["Score"]>=85,"🟢 Confident","🟡 Balanced")
 # Separate pending statuses from active inventory
 if "Status" in data.columns:
     status_norm = data["Status"].astype(str).str.strip()
-    pending_ro_mask = status_norm.str.contains("pending ro", case=False, na=False)
-    pending_deal_mask = status_norm.str.contains("pending deal", case=False, na=False)
+    status_clean = status_norm.str.lower().str.replace(r"[^a-z0-9]", "", regex=True)
+    pending_ro_mask = status_clean.str.contains("pendingro", na=False)
+    pending_deal_mask = status_clean.str.contains("pendingdeal", na=False)
 else:
     pending_ro_mask = pd.Series(False, index=data.index)
     pending_deal_mask = pd.Series(False, index=data.index)
@@ -970,18 +971,23 @@ with tab_ai:
                         if cf_path and os.path.exists(cf_path):
                             with open(cf_path, "rb") as f:
                                 pdf_bytes = f.read()
+
+                            carfax_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+                            st.markdown(
+                                (
+                                    "<a style='display:inline-block;margin-bottom:0.5rem;padding:0.35rem 0.75rem;"
+                                    "background-color:#1f77b4;color:white;border-radius:4px;text-decoration:none;'"
+                                    f" href='data:application/pdf;base64,{carfax_b64}' target='_blank'>🔍 View Carfax</a>"
+                                ),
+                                unsafe_allow_html=True,
+                            )
+
                             st.download_button(
                                 "📄 Download Carfax PDF",
                                 pdf_bytes,
                                 file_name=os.path.basename(cf_path),
                                 mime="application/pdf",
                                 key=f"dl_{r['VIN']}"
-                            )
-
-                            carfax_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-                            st.markdown(
-                                f"<a href='data:application/pdf;base64,{carfax_b64}' target='_blank'>🔍 View Carfax</a>",
-                                unsafe_allow_html=True,
                             )
                         else:
                             st.caption("No Carfax file found for this VIN.")
