@@ -7,7 +7,7 @@
 # - Safe/NaN-proof scoring + summaries + owner ratings
 # ==============================================================
 
-import io, os, re, json, zipfile, traceback, base64
+import io, os, re, json, zipfile, traceback, base64, logging
 from typing import Callable, Optional, Tuple
 from datetime import datetime
 
@@ -686,30 +686,54 @@ if inv_path is None or not os.path.exists(inv_path):
 progress_placeholder = st.sidebar.empty()
 status_placeholder = st.sidebar.empty()
 
+PROGRESS_UI_STATE_KEY = "_carfax_progress_ui_active"
+if PROGRESS_UI_STATE_KEY not in st.session_state:
+    st.session_state[PROGRESS_UI_STATE_KEY] = True
+
+
+def _safe_sidebar_update(callback, *args, **kwargs):
+    """Safely call sidebar UI updates, disabling them if the client disconnects."""
+
+    if not st.session_state.get(PROGRESS_UI_STATE_KEY, True):
+        return
+
+    try:
+        callback(*args, **kwargs)
+    except Exception as exc:  # Broad catch to swallow WebSocket disconnect noise
+        st.session_state[PROGRESS_UI_STATE_KEY] = False
+        logging.warning("Disabling Carfax progress UI updates after failure: %s", exc)
+
+
 def _update_carfax_progress(current: int, total: int, filename: Optional[str], parsed_new: int):
     if total == 0:
-        progress_placeholder.empty()
+        _safe_sidebar_update(progress_placeholder.empty)
         if filename is None and current == 0:
-            status_placeholder.info("No Carfax PDFs found to parse.")
+            _safe_sidebar_update(status_placeholder.info, "No Carfax PDFs found to parse.")
         return
 
     percent = int((current / total) * 100)
     if filename is not None:
-        progress_placeholder.progress(
+        _safe_sidebar_update(
+            progress_placeholder.progress,
             percent,
             text=f"Parsing Carfax PDFs… {current}/{total}"
         )
-        status_placeholder.info(
+        _safe_sidebar_update(
+            status_placeholder.info,
             f"Processing {os.path.basename(filename)} — {parsed_new} new parsed so far."
         )
     else:
-        progress_placeholder.empty()
+        _safe_sidebar_update(progress_placeholder.empty)
         if parsed_new:
-            status_placeholder.success(
+            _safe_sidebar_update(
+                status_placeholder.success,
                 f"Finished parsing Carfax PDFs. Added {parsed_new} new report{'s' if parsed_new != 1 else ''}."
             )
         else:
-            status_placeholder.info("Finished parsing Carfax PDFs. No new reports detected.")
+            _safe_sidebar_update(
+                status_placeholder.info,
+                "Finished parsing Carfax PDFs. No new reports detected."
+            )
 
 if process_btn or added_pdfs or True:
     new_count = parse_new_carfax_pdfs(progress_callback=_update_carfax_progress)
