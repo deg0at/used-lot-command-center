@@ -215,8 +215,9 @@ def render_vehicle_card(
 
     similar_info = None
 
-    with st.container(border=True):
-        layout_cols = st.columns([30, 1])
+    card_container = st.container(border=True)
+    with card_container:
+        layout_cols = card_container.columns([30, 1])
         main_col = layout_cols[0]
         with layout_cols[1]:
             if compare_checkbox_key:
@@ -225,7 +226,7 @@ def render_vehicle_card(
                 st.empty()
 
         with main_col:
-            c1, c2, c3 = st.columns([2, 1, 2])
+            c1, c2, c3 = main_col.columns([2, 1, 2])
 
             with c1:
                 year_val = row.get("Year")
@@ -398,7 +399,7 @@ def render_vehicle_card(
                     ("Model", "model"),
                     ("Price", "price"),
                 ]
-                sim_cols = st.columns(3)
+                sim_cols = main_col.columns(3)
                 sim_values = {}
                 for (label, key_name), col in zip(sim_labels, sim_cols):
                     key = (similar_checkbox_keys or {}).get(key_name)
