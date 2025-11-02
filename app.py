@@ -1155,6 +1155,22 @@ data["ValueCategory"] = np.where(
 )
 data["SalesMood"] = np.where(data["Score"]>=85,"🟢 Confident","🟡 Balanced")
 
+# Composite ranking across all available score metrics
+score_sort_cols = [
+    col for col in ["Score", "CarfaxQualityScore", "SafetyScore", "StoryScore"] if col in data.columns
+]
+if score_sort_cols:
+    ranking_order = (
+        data.sort_values(score_sort_cols, ascending=[False] * len(score_sort_cols))
+        .reset_index()
+    )
+    ranking = pd.Series(
+        np.arange(1, len(ranking_order) + 1, dtype=int), index=ranking_order["index"]
+    )
+    data["Ranking"] = ranking.reindex(data.index).astype("Int64")
+else:
+    data["Ranking"] = pd.Series(pd.NA, index=data.index, dtype="Int64")
+
 # Separate pending statuses from active inventory
 if "Status" in data.columns:
     status_norm = data["Status"].astype(str).str.strip()
@@ -1312,17 +1328,56 @@ with tab_listings:
     if data.empty:
         st.info("No active inventory available. Upload a listings file to get started.")
     else:
+        display_df = data.copy()
+
+        if "Year" in display_df.columns:
+            def _fmt_year(val):
+                if pd.isna(val):
+                    return ""
+                txt = str(val).strip()
+                if not txt:
+                    return ""
+                try:
+                    return str(int(float(txt.replace(",", ""))))
+                except Exception:
+                    return txt.replace(",", "")
+
+            display_df["Year"] = display_df["Year"].apply(_fmt_year)
+
+        rename_map = {
+            "CarfaxUploaded": "Carfax Uploaded",
+            "KBBValue": "MSRP / KBB",
+            "Days": "Days In Inv",
+            "Warranty": "Warr.",
+            "ValueCategory": "Value Category",
+            "SafetyScore": "Safety Score",
+        }
+        display_df = display_df.rename(columns=rename_map)
+
         cols = [
-            "CarfaxUploaded","VIN","Year","Make","Model","Trim","Body","Drive Train",
-            "Mileage","Price","KBBValue","ValueCategory",
-            "AccidentSeverity","OwnerCount","ServiceEvents","MajorParts",
-            "CarfaxQualityLabel","CarfaxQualityScore","StoryLabel","StoryScore",
-            "SafetyScore","Score","Days","Status","pend. RO","pend. deal"
+            "Carfax Uploaded",
+            "Ranking",
+            "Year",
+            "Make",
+            "Model",
+            "Trim",
+            "Price",
+            "MSRP / KBB",
+            "Days In Inv",
+            "Mileage",
+            "Drive Train",
+            "Body",
+            "Warr.",
+            "CPO",
+            "Value Category",
+            "CarfaxQualityLabel",
+            "CarfaxQualityScore",
+            "Safety Score",
         ]
-        cols = [c for c in cols if c in data.columns]
-        table_height = max(360, int(42 * (len(data) + 1)))
+        cols = [c for c in cols if c in display_df.columns]
+        table_height = max(360, int(42 * (len(display_df) + 1)))
         st.dataframe(
-            data[cols],
+            display_df[cols],
             use_container_width=True,
             hide_index=True,
             height=table_height,
