@@ -180,24 +180,9 @@ def clear_inventory_selection_state(trigger_rerun: bool = False):
 def render_vehicle_card(
     row: pd.Series,
     ai_enabled: bool,
-    show_full_details: bool = False,
     compare_checkbox_key: Optional[str] = None,
-    show_similar_controls: bool = False,
-    similar_checkbox_keys: Optional[dict] = None,
-    similar_defaults: Optional[dict] = None,
 ):
-    """Render a single vehicle card with summary metrics and optional full details.
-
-    When *compare_checkbox_key* is provided, a compare checkbox is displayed in the
-    upper-right corner of the card. When *show_similar_controls* is ``True`` the
-    card will also render "show similar" checkboxes using the provided
-    *similar_checkbox_keys* and *similar_defaults* to manage state.
-
-    Returns:
-        Optional[dict]: Information about the currently selected "show similar"
-        filters, keyed by "vin" and each enabled filter type. ``None`` when the
-        caller does not request similar vehicle controls.
-    """
+    """Render a simplified vehicle card focused on the essentials."""
 
     vin_value = str(row.get("VIN") or "Unknown VIN")
 
@@ -213,149 +198,123 @@ def render_vehicle_card(
             pass
         return str(value)
 
-    similar_info = None
+    def _format_mileage(value) -> str:
+        mileage_text = ""
+        if isinstance(value, str):
+            mileage_text = value.strip()
+        elif value is not None:
+            try:
+                if not pd.isna(value):
+                    mileage_text = f"{int(float(value)):,}"
+            except Exception:
+                mileage_text = str(value)
+        if mileage_text:
+            lower = mileage_text.lower()
+            if lower.endswith("mi") or "mile" in lower:
+                return mileage_text
+            return f"{mileage_text} mi"
+        return "—"
+
+    def _format_carfax_score(value) -> str:
+        try:
+            return f"{int(float(value))}/100"
+        except Exception:
+            cleaned = _clean_text(value)
+            return f"{cleaned}/100" if cleaned else "—"
+
+    year_val = row.get("Year")
+    try:
+        year_text = f"{int(float(year_val))} " if pd.notna(year_val) else ""
+    except (TypeError, ValueError):
+        year_text = ""
+
+    title = f"{year_text}{row.get('Make', '')} {row.get('Model', '')} {row.get('Trim') or ''}".strip()
+
+    stock_value = ""
+    for field in ["StockNumber", "Stock #", "Stock", "StockNum"]:
+        val = row.get(field)
+        if val is None:
+            continue
+        try:
+            if pd.isna(val):
+                continue
+        except Exception:
+            pass
+        text_val = str(val).strip()
+        if text_val:
+            stock_value = text_val
+            break
+
+    price_text = _clean_text(row.get("Price")) or "—"
+    mileage_text = _format_mileage(row.get("Mileage"))
+    carfax_score_text = _format_carfax_score(row.get("CarfaxQualityScore"))
+    stats_line_parts = [price_text, mileage_text, f"Carfax {carfax_score_text}"]
+    stats_line = " | ".join(txt for txt in stats_line_parts if txt)
+
+    carfax_link = clean_carfax_link(row.get("CarfaxLink", ""))
+    cf_path = find_carfax_file(vin_value)
+    pdf_bytes = None
+    if cf_path and os.path.exists(cf_path):
+        try:
+            with open(cf_path, "rb") as f:
+                pdf_bytes = f.read()
+        except OSError:
+            pdf_bytes = None
+
+    summary = summarize_carfax(row)
 
     card_container = st.container(border=True)
     with card_container:
-        details_col, metrics_col, talk_col, compare_col = st.columns([2.4, 1.2, 1.6, 0.6])
-
-        with compare_col:
+        header_cols = st.columns([0.85, 0.15])
+        with header_cols[0]:
+            st.markdown(f"### {title or 'Vehicle'}")
+            if stock_value:
+                st.markdown(
+                    f"<div style='font-weight:600;font-size:1.05rem;'>Stock #{stock_value}</div>",
+                    unsafe_allow_html=True,
+                )
+            st.caption(stats_line)
+        with header_cols[1]:
             if compare_checkbox_key:
-                st.checkbox("Compare", key=compare_checkbox_key)
+                st.checkbox(
+                    "",
+                    key=compare_checkbox_key,
+                    label_visibility="hidden",
+                )
             else:
                 st.empty()
 
-        with details_col:
-            year_val = row.get("Year")
-            try:
-                yr = int(float(year_val)) if pd.notna(year_val) else ""
-            except (TypeError, ValueError):
-                yr = ""
+        st.markdown(f"{summary}")
+        st.caption(f"VIN: {vin_value}")
 
-                title = f"{yr} {row.get('Make','')} {row.get('Model','')} {row.get('Trim') or ''}".strip()
-                st.markdown(f"**{title or 'Vehicle'}**")
-                price_raw = row.get("Price")
-                price_text = _clean_text(price_raw)
-                if not price_text:
-                    price_text = "—"
-                st.markdown(
-                    f"<div style='font-size:1.1rem'><b>{price_text}</b></div>",
-                    unsafe_allow_html=True,
-                )
+        if carfax_link:
+            st.markdown(
+                (
+                    "<div style='margin-top:0.75rem;'>"
+                    "<a style='display:inline-block;padding:0.45rem 0.9rem;background-color:#1f77b4;"
+                    "color:white;border-radius:4px;text-decoration:none;font-weight:600;'"
+                    f" href='{carfax_link}' target='_blank'>🔍 View Carfax</a>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+        elif pdf_bytes:
+            carfax_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+            st.markdown(
+                (
+                    "<div style='margin-top:0.75rem;'>"
+                    "<a style='display:inline-block;padding:0.45rem 0.9rem;background-color:#1f77b4;"
+                    "color:white;border-radius:4px;text-decoration:none;font-weight:600;'"
+                    f" href='data:application/pdf;base64,{carfax_b64}' target='_blank'>🔍 View Carfax</a>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption("No Carfax file found for this VIN.")
 
-                body_text = _clean_text(row.get("Body"))
-                drivetrain_text = _clean_text(row.get("Drive Train"))
-                mileage_raw = row.get("Mileage")
-                mileage_text = ""
-                if isinstance(mileage_raw, str):
-                    mileage_text = mileage_raw.strip()
-                elif mileage_raw is not None:
-                    try:
-                        if not pd.isna(mileage_raw):
-                            mileage_text = f"{int(float(mileage_raw)):,}"
-                    except Exception:
-                        mileage_text = str(mileage_raw)
-                mileage_display = ""
-                if mileage_text:
-                    lower_mileage = mileage_text.lower()
-                    if lower_mileage.endswith("mi") or "mile" in lower_mileage:
-                        mileage_display = mileage_text
-                    else:
-                        mileage_display = f"{mileage_text} mi"
-                descriptors = " • ".join(
-                    [
-                        txt
-                        for txt in [body_text, mileage_display, drivetrain_text]
-                        if txt
-                    ]
-                )
-                if descriptors:
-                    st.caption(descriptors)
-
-                st.caption(f"VIN: {vin_value}")
-
-                summary = summarize_carfax(row)
-                svc_interval = row.get("AvgServiceInterval")
-                svc_info = ""
-                try:
-                    if svc_interval and not pd.isna(svc_interval):
-                        svc_info = f" • Avg service every ~{int(float(svc_interval)):,} mi"
-                except Exception:
-                    svc_info = ""
-                major_parts = row.get("MajorParts", "None")
-                major_info = (
-                    f" • Major parts replaced: {major_parts}"
-                    if isinstance(major_parts, str) and major_parts and major_parts != "None"
-                    else ""
-                )
-                st.markdown(f"_{summary}{svc_info}{major_info}_")
-                st.caption(
-                    f"**Vehicle Story: {row.get('StoryLabel','?')} ({int(row.get('StoryScore',0))}/100)**"
-                )
-
-                owner_ratings = row.get("OwnerRatings")
-                if isinstance(owner_ratings, list) and owner_ratings:
-                    owners_summary = " • ".join(
-                        [
-                            f"Owner {o.get('Owner')}: {o.get('Score')}/100"
-                            for o in owner_ratings
-                            if isinstance(o, dict)
-                        ]
-                    )
-                    if owners_summary:
-                        st.caption(f"Owner Ratings: {owners_summary}")
-
-                carfax_link = clean_carfax_link(row.get("CarfaxLink", ""))
-                cf_path = find_carfax_file(vin_value)
-                pdf_bytes = None
-
-                if cf_path and os.path.exists(cf_path):
-                    try:
-                        with open(cf_path, "rb") as f:
-                            pdf_bytes = f.read()
-                    except OSError:
-                        pdf_bytes = None
-
-                if carfax_link:
-                    st.markdown(
-                        (
-                            "<a style='display:inline-block;margin-bottom:0.5rem;padding:0.35rem 0.75rem;"
-                            "background-color:#1f77b4;color:white;border-radius:4px;text-decoration:none;'"
-                            f" href='{carfax_link}' target='_blank'>🔍 View Carfax</a>"
-                        ),
-                        unsafe_allow_html=True,
-                    )
-                elif pdf_bytes:
-                    carfax_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-                    st.markdown(
-                        (
-                            "<a style='display:inline-block;margin-bottom:0.5rem;padding:0.35rem 0.75rem;"
-                            "background-color:#1f77b4;color:white;border-radius:4px;text-decoration:none;'"
-                            f" href='data:application/pdf;base64,{carfax_b64}' target='_blank'>🔍 View Carfax</a>"
-                        ),
-                        unsafe_allow_html=True,
-                    )
-
-                if pdf_bytes:
-                    st.download_button(
-                        "📄 Download Carfax PDF",
-                        pdf_bytes,
-                        file_name=os.path.basename(cf_path) if cf_path else f"{vin_value}_carfax.pdf",
-                        mime="application/pdf",
-                        key=f"dl_{vin_value}",
-                    )
-
-                if not carfax_link and not pdf_bytes:
-                    st.caption("No Carfax file found for this VIN.")
-
-                if st.button(f"🧠 Generate Story for {vin_value}", key=f"story_{vin_value}"):
-                    with st.spinner(
-                        "Generating story..." if ai_enabled else "Loading cached/fallback story..."
-                    ):
-                        story = ai_vehicle_story(row.get("VIN", ""), row.get("CarfaxText", "") or "")
-                    st.write(f"**AI Story:** {story}")
-
-        with metrics_col:
+        with st.expander("More vehicle insights"):
+            metrics_cols = st.columns(3)
             score = row.get("Score")
             safety = row.get("SafetyScore")
             carfax_score = row.get("CarfaxQualityScore")
@@ -376,62 +335,58 @@ def render_vehicle_card(
             except Exception:
                 carfax_value = _clean_text(carfax_score) or "—"
 
-            st.metric("Smart", smart_value)
-            st.metric("Safety", safety_value)
-            st.metric("Carfax", carfax_value)
+            metrics_cols[0].metric("Smart", smart_value)
+            metrics_cols[1].metric("Safety", safety_value)
+            metrics_cols[2].metric("Carfax", carfax_value)
             st.metric("Value", value_cat)
 
-        with talk_col:
+            svc_interval = row.get("AvgServiceInterval")
+            svc_info = ""
+            try:
+                if svc_interval and not pd.isna(svc_interval):
+                    svc_info = f"Avg service every ~{int(float(svc_interval)):,} mi"
+            except Exception:
+                svc_info = ""
+            major_parts = row.get("MajorParts", "None")
+            if svc_info or (isinstance(major_parts, str) and major_parts and major_parts != "None"):
+                extra_parts = (
+                    f"Major parts replaced: {major_parts}"
+                    if isinstance(major_parts, str) and major_parts and major_parts != "None"
+                    else ""
+                )
+                st.caption(" | ".join(txt for txt in [svc_info, extra_parts] if txt))
+
+            owner_ratings = row.get("OwnerRatings")
+            if isinstance(owner_ratings, list) and owner_ratings:
+                owners_summary = " • ".join(
+                    [
+                        f"Owner {o.get('Owner')}: {o.get('Score')}/100"
+                        for o in owner_ratings
+                        if isinstance(o, dict)
+                    ]
+                )
+                if owners_summary:
+                    st.caption(f"Owner Ratings: {owners_summary}")
+
             tt = ai_talk_track(row) if ai_enabled else ""
             if tt:
                 st.caption(tt)
 
-        if show_similar_controls and similar_checkbox_keys:
-            base_vin = None
-            if isinstance(similar_defaults, dict):
-                base_vin = similar_defaults.get("base")
-
-            sim_labels = [
-                ("Make", "make"),
-                ("Model", "model"),
-                ("Price", "price"),
-            ]
-            sim_values = {}
-            for label, key_name in sim_labels:
-                key = (similar_checkbox_keys or {}).get(key_name)
-                if not key:
-                    sim_values[key_name] = False
-                    continue
-
-                default_val = False
-                if base_vin == vin_value and isinstance(similar_defaults, dict):
-                    default_val = bool(similar_defaults.get(key_name, False))
-
-                if key not in st.session_state:
-                    st.session_state[key] = default_val
-                elif base_vin != vin_value and st.session_state.get(key):
-                    st.session_state[key] = False
-                elif base_vin == vin_value and default_val and not st.session_state.get(key):
-                    st.session_state[key] = default_val
-
-                sim_values[key_name] = st.checkbox(label, key=key)
-
-            similar_info = {
-                "vin": vin_value,
-                **sim_values,
-            }
-
-            if show_full_details:
-                details_df = pd.DataFrame(
-                    {
-                        "Field": list(row.index),
-                        "Value": [row.get(col) for col in row.index],
-                    }
+            if pdf_bytes:
+                st.download_button(
+                    "📄 Download Carfax PDF",
+                    pdf_bytes,
+                    file_name=os.path.basename(cf_path) if cf_path else f"{vin_value}_carfax.pdf",
+                    mime="application/pdf",
+                    key=f"dl_{vin_value}",
                 )
-                st.markdown("#### Full Vehicle Details")
-                st.dataframe(details_df, use_container_width=True, hide_index=True)
 
-    return similar_info
+            if st.button(f"🧠 Generate Story for {vin_value}", key=f"story_{vin_value}"):
+                with st.spinner(
+                    "Generating story..." if ai_enabled else "Loading cached/fallback story..."
+                ):
+                    story = ai_vehicle_story(row.get("VIN", ""), row.get("CarfaxText", "") or "")
+                st.write(f"**AI Story:** {story}")
 
 
 # ------------------ PDF Parsing ------------------
@@ -1391,7 +1346,7 @@ with tab_finder:
 
     ss.setdefault("finder_compare_active", False)
     ss.setdefault("finder_compare_vins", [])
-    ss.setdefault("finder_similar_selection", {"base": None, "make": False, "model": False, "price": False})
+    ss.setdefault("finder_compare_base_vin", None)
 
     make_options = sorted(data["Make"].dropna().unique()) if "Make" in data.columns else []
     body_options = sorted(data["Body"].dropna().unique()) if "Body" in data.columns else []
@@ -1433,6 +1388,31 @@ with tab_finder:
             selected_price = (None, None)
             price_col.caption("No price data available in this inventory upload.")
 
+        compare_msg_placeholder = st.empty()
+        compare_cols = st.columns([1, 1, 2])
+        with compare_cols[0]:
+            compare_clicked = st.button(
+                "Compare Selected",
+                type="primary",
+                key="finder_compare_button",
+            )
+        with compare_cols[1]:
+            clear_clicked = st.button("Clear Comparison", key="finder_compare_clear")
+
+        st.caption("Add matching vehicles to comparisons by:")
+        match_make = st.checkbox(
+            "Make",
+            key="finder_compare_filter_make",
+        )
+        match_model = st.checkbox(
+            "Model",
+            key="finder_compare_filter_model",
+        )
+        match_price = st.checkbox(
+            "Price (±20%)",
+            key="finder_compare_filter_price",
+        )
+
     mask = pd.Series(True, index=data.index)
     mask &= data["Score"].between(sc_min, sc_max)
     mask &= data["SafetyScore"] >= min_safety
@@ -1450,97 +1430,25 @@ with tab_finder:
     if sort_cols:
         base_filtered.sort_values(sort_cols, ascending=[False] * len(sort_cols), inplace=True)
 
-    available_vins = base_filtered["VIN"].astype(str).tolist() if "VIN" in base_filtered.columns else []
-
-    def _clear_similar_state(vins):
-        for v in vins:
-            for key_name in ["make", "model", "price"]:
-                key = f"similar_{v}_{key_name}"
-                if key in st.session_state:
-                    st.session_state[key] = False
-
-    sim_sel = ss["finder_similar_selection"]
-    if sim_sel["base"] and sim_sel["base"] not in available_vins:
-        _clear_similar_state(available_vins + [sim_sel["base"]])
-        ss["finder_similar_selection"] = {"base": None, "make": False, "model": False, "price": False}
-        sim_sel = ss["finder_similar_selection"]
-
-    active_update = None
-    for vin in available_vins:
-        make_val = st.session_state.get(f"similar_{vin}_make", False)
-        model_val = st.session_state.get(f"similar_{vin}_model", False)
-        price_val = st.session_state.get(f"similar_{vin}_price", False)
-        if make_val or model_val or price_val:
-            active_update = {"base": vin, "make": make_val, "model": model_val, "price": price_val}
-            break
-
-    if active_update:
-        if active_update != sim_sel:
-            ss["finder_similar_selection"] = active_update
-            sim_sel = active_update
-        _clear_similar_state([v for v in available_vins if v != sim_sel["base"]])
-    else:
-        base_vin = sim_sel.get("base")
-        if base_vin and not any(
-            st.session_state.get(f"similar_{base_vin}_{name}", False) for name in ["make", "model", "price"]
-        ):
-            _clear_similar_state(available_vins + [base_vin])
-            ss["finder_similar_selection"] = {"base": None, "make": False, "model": False, "price": False}
-            sim_sel = ss["finder_similar_selection"]
-
     filtered = base_filtered.copy()
-    sim_sel = ss["finder_similar_selection"]
-    similar_labels = []
-    if sim_sel["base"] and any(sim_sel[k] for k in ["make", "model", "price"]):
-        base_row = base_filtered[base_filtered["VIN"].astype(str) == sim_sel["base"]]
-        if not base_row.empty:
-            base_row = base_row.iloc[0]
-            similar_mask = pd.Series(True, index=filtered.index)
-            if sim_sel["make"] and "Make" in filtered.columns:
-                similar_mask &= filtered["Make"] == base_row.get("Make")
-                similar_labels.append("make")
-            if sim_sel["model"] and "Model" in filtered.columns:
-                similar_mask &= filtered["Model"] == base_row.get("Model")
-                similar_labels.append("model")
-            if sim_sel["price"]:
-                base_price = base_row.get("PriceNum")
-                if base_price is None or (isinstance(base_price, float) and np.isnan(base_price)):
-                    base_price = to_num(base_row.get("Price"))
-                if base_price is not None and not (isinstance(base_price, float) and np.isnan(base_price)):
-                    lower = base_price * 0.8
-                    upper = base_price * 1.2
-                    if "PriceNum" in filtered.columns:
-                        similar_mask &= filtered["PriceNum"].between(lower, upper)
-                    else:
-                        price_series = filtered.get("Price")
-                        if price_series is not None:
-                            numeric_prices = price_series.apply(to_num)
-                            similar_mask &= numeric_prices.between(lower, upper)
-                    similar_labels.append("price (±20%)")
-            filtered = filtered.loc[similar_mask].copy()
 
-    display_rows = []
+    display_rows_all = []
     for idx, row in filtered.iterrows():
         vin_val = row.get("VIN")
-        vin_key = str(vin_val) if vin_val is not None and not (isinstance(vin_val, float) and np.isnan(vin_val)) else f"row_{idx}"
-        display_rows.append((idx, row, vin_key))
-    display_vins = [vin for _, _, vin in display_rows]
+        if vin_val is None or (isinstance(vin_val, float) and np.isnan(vin_val)):
+            vin_key = f"row_{idx}"
+        else:
+            vin_key = str(vin_val)
+        display_rows_all.append((idx, row, vin_key))
+    display_vins_all = [vin for _, _, vin in display_rows_all]
 
-    if sim_sel["base"] and similar_labels:
-        st.info(
-            f"Showing vehicles similar to VIN {sim_sel['base']} by {', '.join(similar_labels)}."
-        )
-
-    compare_defaults = set(ss.get("finder_compare_vins", []))
-    compare_defaults = {vin for vin in compare_defaults if vin in display_vins}
+    compare_defaults = set(
+        vin for vin in ss.get("finder_compare_vins", []) if vin in display_vins_all
+    )
     if compare_defaults != set(ss.get("finder_compare_vins", [])):
         ss["finder_compare_vins"] = list(compare_defaults)
-    compare_active = ss.get("finder_compare_active", False)
-    if compare_active and len(compare_defaults) < 2:
-        compare_active = False
-        ss["finder_compare_active"] = False
 
-    for vin in display_vins:
+    for vin in display_vins_all:
         key = f"compare_{vin}"
         if key not in st.session_state:
             st.session_state[key] = vin in compare_defaults
@@ -1548,49 +1456,100 @@ with tab_finder:
             st.session_state[key] = True
 
     selected_checkbox_vins = [
-        vin for vin in display_vins if st.session_state.get(f"compare_{vin}", False)
+        vin for vin in display_vins_all if st.session_state.get(f"compare_{vin}", False)
     ]
 
-    compare_cols = st.columns([1, 1, 6])
-    compare_feedback = compare_cols[2].empty()
-    with compare_cols[0]:
-        compare_clicked = st.button("Compare Selected", type="primary")
-    with compare_cols[1]:
-        clear_clicked = st.button("Clear Comparison")
+    compare_active = ss.get("finder_compare_active", False)
+    compare_vins = set(compare_defaults)
 
     if compare_clicked:
-        if len(selected_checkbox_vins) >= 2:
-            ss["finder_compare_active"] = True
-            ss["finder_compare_vins"] = selected_checkbox_vins
-            compare_active = True
-            compare_defaults = set(selected_checkbox_vins)
-        else:
-            compare_feedback.warning("Select at least two vehicles to compare.")
+        if not selected_checkbox_vins:
+            compare_msg_placeholder.warning("Select at least one vehicle to compare.")
             ss["finder_compare_active"] = False
             ss["finder_compare_vins"] = []
+            ss["finder_compare_base_vin"] = None
             compare_active = False
-            compare_defaults = set()
+            compare_vins = set()
+        else:
+            base_vin = selected_checkbox_vins[0]
+            comparison_vins = set(selected_checkbox_vins)
+            if "VIN" in base_filtered.columns:
+                base_row = base_filtered[base_filtered["VIN"].astype(str) == base_vin]
+            else:
+                base_row = pd.DataFrame()
+            if not base_row.empty:
+                base_row = base_row.iloc[0]
+                if match_make and "Make" in base_filtered.columns:
+                    comparison_vins.update(
+                        base_filtered.loc[base_filtered["Make"] == base_row.get("Make"), "VIN"].astype(str)
+                    )
+                if match_model and "Model" in base_filtered.columns:
+                    comparison_vins.update(
+                        base_filtered.loc[base_filtered["Model"] == base_row.get("Model"), "VIN"].astype(str)
+                    )
+                if match_price:
+                    base_price = base_row.get("PriceNum")
+                    if base_price is None or (isinstance(base_price, float) and np.isnan(base_price)):
+                        base_price = to_num(base_row.get("Price"))
+                    if base_price is not None and not (isinstance(base_price, float) and np.isnan(base_price)):
+                        lower = base_price * 0.8
+                        upper = base_price * 1.2
+                        if "PriceNum" in base_filtered.columns:
+                            price_matches = base_filtered[base_filtered["PriceNum"].between(lower, upper)]
+                        else:
+                            price_series = base_filtered.get("Price")
+                            if price_series is not None:
+                                numeric_prices = price_series.apply(to_num)
+                                price_matches = base_filtered[numeric_prices.between(lower, upper)]
+                            else:
+                                price_matches = pd.DataFrame()
+                        if not price_matches.empty and "VIN" in price_matches.columns:
+                            comparison_vins.update(price_matches["VIN"].astype(str))
+
+            ss["finder_compare_active"] = True
+            ss["finder_compare_vins"] = list(comparison_vins)
+            ss["finder_compare_base_vin"] = base_vin
+            compare_active = True
+            compare_vins = comparison_vins
+            for vin in comparison_vins:
+                key = f"compare_{vin}"
+                st.session_state[key] = True
+            compare_msg_placeholder.success(
+                f"Comparing {len(comparison_vins)} vehicle{'s' if len(comparison_vins) != 1 else ''}."
+            )
 
     if clear_clicked:
-        for vin in display_vins:
+        for vin in display_vins_all:
             key = f"compare_{vin}"
             if key in st.session_state:
                 st.session_state[key] = False
         ss["finder_compare_active"] = False
         ss["finder_compare_vins"] = []
+        ss["finder_compare_base_vin"] = None
         compare_active = False
-        compare_defaults = set()
+        compare_vins = set()
+        compare_msg_placeholder.info("Comparison cleared.")
 
-    compare_vins = list(compare_defaults)
+    compare_vins = set(
+        vin for vin in ss.get("finder_compare_vins", []) if vin in display_vins_all
+    )
+    ss["finder_compare_vins"] = list(compare_vins)
     if compare_active and compare_vins:
         filtered = filtered[filtered["VIN"].astype(str).isin(compare_vins)].copy()
-        st.success(f"Comparing {len(compare_vins)} vehicles. Clear comparison to show all matches.")
-        display_rows = []
-        for idx, row in filtered.iterrows():
-            vin_val = row.get("VIN")
-            vin_key = str(vin_val) if vin_val is not None and not (isinstance(vin_val, float) and np.isnan(vin_val)) else f"row_{idx}"
-            display_rows.append((idx, row, vin_key))
-        display_vins = [vin for _, _, vin in display_rows]
+        st.success(f"Comparing {len(compare_vins)} vehicle{'s' if len(compare_vins) != 1 else ''}. Clear comparison to show all matches.")
+    else:
+        compare_active = False
+        ss["finder_compare_active"] = False
+
+    display_rows = []
+    for idx, row in filtered.iterrows():
+        vin_val = row.get("VIN")
+        if vin_val is None or (isinstance(vin_val, float) and np.isnan(vin_val)):
+            vin_key = f"row_{idx}"
+        else:
+            vin_key = str(vin_val)
+        display_rows.append((idx, row, vin_key))
+    display_vins = [vin for _, _, vin in display_rows]
 
     st.divider()
     st.subheader(f"Matching Vehicles ({len(filtered)})")
@@ -1608,13 +1567,6 @@ with tab_finder:
                         row,
                         ai_enabled,
                         compare_checkbox_key=f"compare_{vin_key}",
-                        show_similar_controls=True,
-                        similar_checkbox_keys={
-                            "make": f"similar_{vin_key}_make",
-                            "model": f"similar_{vin_key}_model",
-                            "price": f"similar_{vin_key}_price",
-                        },
-                        similar_defaults=ss["finder_similar_selection"].copy(),
                     )
 
     st.divider()
