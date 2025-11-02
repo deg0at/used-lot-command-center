@@ -217,23 +217,20 @@ def render_vehicle_card(
 
     card_container = st.container(border=True)
     with card_container:
-        layout_cols = card_container.columns([30, 1])
-        main_col = layout_cols[0]
-        with layout_cols[1]:
+        details_col, metrics_col, talk_col, compare_col = st.columns([2.4, 1.2, 1.6, 0.6])
+
+        with compare_col:
             if compare_checkbox_key:
                 st.checkbox("Compare", key=compare_checkbox_key)
             else:
                 st.empty()
 
-        with main_col:
-            c1, c2, c3 = main_col.columns([2, 1, 2])
-
-            with c1:
-                year_val = row.get("Year")
-                try:
-                    yr = int(float(year_val)) if pd.notna(year_val) else ""
-                except (TypeError, ValueError):
-                    yr = ""
+        with details_col:
+            year_val = row.get("Year")
+            try:
+                yr = int(float(year_val)) if pd.notna(year_val) else ""
+            except (TypeError, ValueError):
+                yr = ""
 
                 title = f"{yr} {row.get('Make','')} {row.get('Model','')} {row.get('Trim') or ''}".strip()
                 st.markdown(f"**{title or 'Vehicle'}**")
@@ -358,72 +355,71 @@ def render_vehicle_card(
                         story = ai_vehicle_story(row.get("VIN", ""), row.get("CarfaxText", "") or "")
                     st.write(f"**AI Story:** {story}")
 
-            with c2:
-                score = row.get("Score")
-                safety = row.get("SafetyScore")
-                carfax_score = row.get("CarfaxQualityScore")
-                value_cat = row.get("ValueCategory", "—")
+        with metrics_col:
+            score = row.get("Score")
+            safety = row.get("SafetyScore")
+            carfax_score = row.get("CarfaxQualityScore")
+            value_cat = row.get("ValueCategory", "—")
 
-                try:
-                    smart_value = f"{float(score):.0f}"
-                except Exception:
-                    smart_value = _clean_text(score) or "—"
+            try:
+                smart_value = f"{float(score):.0f}"
+            except Exception:
+                smart_value = _clean_text(score) or "—"
 
-                try:
-                    safety_value = f"{float(safety):.0f}"
-                except Exception:
-                    safety_value = _clean_text(safety) or "—"
+            try:
+                safety_value = f"{float(safety):.0f}"
+            except Exception:
+                safety_value = _clean_text(safety) or "—"
 
-                try:
-                    carfax_value = f"{int(float(carfax_score))}/100"
-                except Exception:
-                    carfax_value = _clean_text(carfax_score) or "—"
+            try:
+                carfax_value = f"{int(float(carfax_score))}/100"
+            except Exception:
+                carfax_value = _clean_text(carfax_score) or "—"
 
-                st.metric("Smart", smart_value)
-                st.metric("Safety", safety_value)
-                st.metric("Carfax", carfax_value)
-                st.metric("Value", value_cat)
+            st.metric("Smart", smart_value)
+            st.metric("Safety", safety_value)
+            st.metric("Carfax", carfax_value)
+            st.metric("Value", value_cat)
 
-            with c3:
-                tt = ai_talk_track(row) if ai_enabled else ""
-                if tt:
-                    st.caption(tt)
+        with talk_col:
+            tt = ai_talk_track(row) if ai_enabled else ""
+            if tt:
+                st.caption(tt)
 
-            if show_similar_controls and similar_checkbox_keys:
-                base_vin = None
-                if isinstance(similar_defaults, dict):
-                    base_vin = similar_defaults.get("base")
+        if show_similar_controls and similar_checkbox_keys:
+            base_vin = None
+            if isinstance(similar_defaults, dict):
+                base_vin = similar_defaults.get("base")
 
-                sim_labels = [
-                    ("Make", "make"),
-                    ("Model", "model"),
-                    ("Price", "price"),
-                ]
-                sim_cols = main_col.columns(3)
-                sim_values = {}
-                for (label, key_name), col in zip(sim_labels, sim_cols):
-                    key = (similar_checkbox_keys or {}).get(key_name)
-                    if not key:
-                        sim_values[key_name] = False
-                        continue
+            sim_labels = [
+                ("Make", "make"),
+                ("Model", "model"),
+                ("Price", "price"),
+            ]
+            sim_values = {}
+            for label, key_name in sim_labels:
+                key = (similar_checkbox_keys or {}).get(key_name)
+                if not key:
+                    sim_values[key_name] = False
+                    continue
 
-                    default_val = False
-                    if base_vin == vin_value and isinstance(similar_defaults, dict):
-                        default_val = bool(similar_defaults.get(key_name, False))
+                default_val = False
+                if base_vin == vin_value and isinstance(similar_defaults, dict):
+                    default_val = bool(similar_defaults.get(key_name, False))
 
-                    if key not in st.session_state:
-                        st.session_state[key] = default_val
-                    elif base_vin != vin_value and st.session_state.get(key):
-                        st.session_state[key] = False
-                    elif base_vin == vin_value and default_val and not st.session_state.get(key):
-                        st.session_state[key] = default_val
+                if key not in st.session_state:
+                    st.session_state[key] = default_val
+                elif base_vin != vin_value and st.session_state.get(key):
+                    st.session_state[key] = False
+                elif base_vin == vin_value and default_val and not st.session_state.get(key):
+                    st.session_state[key] = default_val
 
-                    sim_values[key_name] = col.checkbox(label, key=key)
+                sim_values[key_name] = st.checkbox(label, key=key)
 
-                similar_info = {
-                    "vin": vin_value,
-                    **sim_values,
-                }
+            similar_info = {
+                "vin": vin_value,
+                **sim_values,
+            }
 
             if show_full_details:
                 details_df = pd.DataFrame(
