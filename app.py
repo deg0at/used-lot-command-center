@@ -192,6 +192,11 @@ def render_vehicle_card(
     upper-right corner of the card. When *show_similar_controls* is ``True`` the
     card will also render "show similar" checkboxes using the provided
     *similar_checkbox_keys* and *similar_defaults* to manage state.
+
+    Returns:
+        Optional[dict]: Information about the currently selected "show similar"
+        filters, keyed by "vin" and each enabled filter type. ``None`` when the
+        caller does not request similar vehicle controls.
     """
 
     vin_value = str(row.get("VIN") or "Unknown VIN")
