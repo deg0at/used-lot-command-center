@@ -6,3 +6,6 @@ pypdf==4.2.0
 requests==2.32.3
 pyyaml==6.0.2
 openai==1.51.0
+google-api-python-client==2.147.0
+google-auth==2.35.0
+google-auth-httplib2==0.2.0

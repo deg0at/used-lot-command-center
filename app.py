@@ -16,6 +16,8 @@ import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
 
+from modules.drive_sync import SyncOutcome, sync_google_drive_folder
+
 # ------------------ App Config ------------------
 st.set_page_config(page_title="Used Lot Car Finder", layout="wide")
 st.title("🚗 Used Lot Car Finder")
@@ -27,6 +29,7 @@ LISTINGS_DIR = os.path.join(DATA_DIR, "listings")
 CARFAX_CACHE_PATH = os.path.join(DATA_DIR, "carfax_cache.json")
 STORY_CACHE_PATH  = os.path.join(DATA_DIR, "story_cache.json")
 CARFAX_PARSE_INDEX_PATH = os.path.join(DATA_DIR, "carfax_parse_index.json")
+DRIVE_SYNC_INDEX_PATH = os.path.join(DATA_DIR, "drive_sync_index.json")
 
 # Ensure folders/files exist
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -35,6 +38,29 @@ os.makedirs(LISTINGS_DIR, exist_ok=True)
 for fpath in [CARFAX_CACHE_PATH, STORY_CACHE_PATH, CARFAX_PARSE_INDEX_PATH]:
     if not os.path.exists(fpath):
         with open(fpath, "w") as f: f.write("{}")
+
+
+def _resolve_drive_folder_id() -> str:
+    raw = st.secrets.get("google_drive_folder_id", os.getenv("GOOGLE_DRIVE_FOLDER_ID", ""))
+    if isinstance(raw, str):
+        return raw.strip()
+    if raw is None:
+        return ""
+    return str(raw).strip()
+
+
+drive_sync_outcome: Optional[SyncOutcome] = None
+try:
+    drive_sync_outcome = sync_google_drive_folder(
+        folder_id=_resolve_drive_folder_id(),
+        listings_dir=LISTINGS_DIR,
+        carfax_dir=CARFAX_DIR,
+        index_path=DRIVE_SYNC_INDEX_PATH,
+        secrets=st.secrets,
+    )
+except Exception as exc:
+    logging.error("Google Drive sync failed: %s", exc)
+    drive_sync_outcome = SyncOutcome(downloaded=0, skipped=0, errors=(str(exc),))
 
 
 # Session state helpers for vehicle table/card views
@@ -867,6 +893,15 @@ ss.setdefault("data_df", None)
 
 # ------------------ Sidebar ------------------
 with st.sidebar:
+    if drive_sync_outcome:
+        msg = f"☁️ Drive sync: {drive_sync_outcome.as_status_message()}"
+        if drive_sync_outcome.errors:
+            st.error(msg)
+            for err in drive_sync_outcome.errors:
+                st.caption(f"• {err}")
+        else:
+            st.success(msg)
+
     st.header("Inventory")
     use_last_inv = st.checkbox("Use last saved inventory (data/listings)", value=True)
     inv_upload   = st.file_uploader("Upload new inventory (.csv/.xls/.xlsx)", type=["csv","xls","xlsx"])
