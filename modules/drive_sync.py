@@ -40,10 +40,51 @@ def _load_service_account_info(secrets: Mapping[str, object]) -> Optional[Dict[s
     """Return the service-account info dict from Streamlit secrets/env variables."""
 
     if "google_service_account" in secrets:
-        # Streamlit secrets behave like a config object; convert to dict explicitly.
-        info = dict(secrets["google_service_account"])
-        if info:
-            return info
+        raw_secret = secrets["google_service_account"]
+        # Streamlit secrets behave like a config object and expose mapping-like
+        # access. However, some deployments supply the value as a JSON string.
+        # Guard against non-mapping types before coercing to ``dict`` to avoid
+        # ``TypeError: dictionary update sequence element ...`` when ``dict``
+        # receives a plain string or other iterables.
+        if isinstance(raw_secret, Mapping):
+            info = dict(raw_secret)
+            if info:
+                return info
+        elif isinstance(raw_secret, str):
+            raw_secret = raw_secret.strip()
+            if raw_secret:
+                try:
+                    info = json.loads(raw_secret)
+                    if isinstance(info, dict) and info:
+                        return info
+                except json.JSONDecodeError:
+                    candidate_paths = [raw_secret]
+                    expanded = os.path.expanduser(os.path.expandvars(raw_secret))
+                    if expanded and expanded not in candidate_paths:
+                        candidate_paths.append(expanded)
+
+                    for candidate in candidate_paths:
+                        if not os.path.isfile(candidate):
+                            continue
+                        try:
+                            with open(candidate, "r", encoding="utf-8") as f:
+                                info = json.load(f)
+                            if isinstance(info, dict) and info:
+                                return info
+                        except (OSError, json.JSONDecodeError) as exc:
+                            logging.warning(
+                                "Failed to read google_service_account secret file %s: %s",
+                                candidate,
+                                exc,
+                            )
+                    logging.warning(
+                        "google_service_account secret must be valid JSON or a path to a service-account JSON file; update your Streamlit secrets."
+                    )
+        else:
+            logging.warning(
+                "google_service_account secret is of unsupported type %s; ignoring.",
+                type(raw_secret).__name__,
+            )
 
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if not raw:
