@@ -58,27 +58,8 @@ def _load_service_account_info(secrets: Mapping[str, object]) -> Optional[Dict[s
                     if isinstance(info, dict) and info:
                         return info
                 except json.JSONDecodeError:
-                    candidate_paths = [raw_secret]
-                    expanded = os.path.expanduser(os.path.expandvars(raw_secret))
-                    if expanded and expanded not in candidate_paths:
-                        candidate_paths.append(expanded)
-
-                    for candidate in candidate_paths:
-                        if not os.path.isfile(candidate):
-                            continue
-                        try:
-                            with open(candidate, "r", encoding="utf-8") as f:
-                                info = json.load(f)
-                            if isinstance(info, dict) and info:
-                                return info
-                        except (OSError, json.JSONDecodeError) as exc:
-                            logging.warning(
-                                "Failed to read google_service_account secret file %s: %s",
-                                candidate,
-                                exc,
-                            )
                     logging.warning(
-                        "google_service_account secret must be valid JSON or a path to a service-account JSON file; update your Streamlit secrets."
+                        "google_service_account secret is not valid JSON; ignoring."
                     )
         else:
             logging.warning(
