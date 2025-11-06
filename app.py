@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
+from openpyxl.utils.exceptions import InvalidFileException
 
 from modules.drive_sync import SyncOutcome, sync_google_drive_folder
 
@@ -1037,7 +1038,7 @@ try:
         engine = "openpyxl" if ext == ".xlsx" else "xlrd"
         try:
             raw = pd.read_excel(inv_path, engine=engine)
-        except (zipfile.BadZipFile, ValueError) as exc:
+        except (zipfile.BadZipFile, ValueError, InvalidFileException) as exc:
             try:
                 raw = pd.read_csv(inv_path)
             except Exception as csv_exc:
