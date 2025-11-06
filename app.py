@@ -49,18 +49,25 @@ def _resolve_drive_folder_id() -> str:
     return str(raw).strip()
 
 
-drive_sync_outcome: Optional[SyncOutcome] = None
-try:
-    drive_sync_outcome = sync_google_drive_folder(
-        folder_id=_resolve_drive_folder_id(),
-        listings_dir=LISTINGS_DIR,
-        carfax_dir=CARFAX_DIR,
-        index_path=DRIVE_SYNC_INDEX_PATH,
-        secrets=st.secrets,
-    )
-except Exception as exc:
-    logging.error("Google Drive sync failed: %s", exc)
-    drive_sync_outcome = SyncOutcome(downloaded=0, skipped=0, errors=(str(exc),))
+def _run_drive_sync() -> SyncOutcome:
+    try:
+        return sync_google_drive_folder(
+            folder_id=_resolve_drive_folder_id(),
+            listings_dir=LISTINGS_DIR,
+            carfax_dir=CARFAX_DIR,
+            index_path=DRIVE_SYNC_INDEX_PATH,
+            secrets=st.secrets,
+        )
+    except Exception as exc:
+        logging.error("Google Drive sync failed: %s", exc)
+        return SyncOutcome(downloaded=0, skipped=0, errors=(str(exc),))
+
+
+def ensure_drive_sync(force: bool = False) -> Optional[SyncOutcome]:
+    key = "drive_sync_outcome"
+    if force or key not in st.session_state:
+        st.session_state[key] = _run_drive_sync()
+    return st.session_state.get(key)
 
 
 # Session state helpers for vehicle table/card views
@@ -75,6 +82,9 @@ if "inventory_table_selection" not in st.session_state:
 
 VIN_RE = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
 URL_RE = re.compile(r"https?://[^\s\"'>)]+", re.IGNORECASE)
+
+
+drive_sync_outcome = ensure_drive_sync()
 
 
 def extract_first_url(value: str) -> Optional[str]:
@@ -893,6 +903,9 @@ ss.setdefault("data_df", None)
 
 # ------------------ Sidebar ------------------
 with st.sidebar:
+    if st.button("☁️ Resync Google Drive", help="Run the Drive sync again for this session."):
+        drive_sync_outcome = ensure_drive_sync(force=True)
+
     if drive_sync_outcome:
         msg = f"☁️ Drive sync: {drive_sync_outcome.as_status_message()}"
         if drive_sync_outcome.errors:
