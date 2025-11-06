@@ -108,6 +108,46 @@ def clean_carfax_link(value) -> str:
     link = extract_first_url(value)
     return link or ""
 
+
+def normalize_cpo_flag(value) -> bool:
+    """Convert assorted CPO indicators to a simple boolean flag."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return False
+
+    if isinstance(value, bool):
+        return value
+
+    if pd.isna(value):
+        return False
+
+    text = str(value).strip().lower()
+    if not text:
+        return False
+
+    true_tokens = {
+        "yes",
+        "y",
+        "true",
+        "1",
+        "1.0",
+        "cpo",
+        "certified",
+        "certified pre-owned",
+        "certified preowned",
+    }
+    if text in true_tokens:
+        return True
+
+    if text in {"no", "n", "false", "0", "0.0"}:
+        return False
+
+    # Handle numeric strings and other truthy tokens conservatively
+    try:
+        return float(text) >= 1
+    except ValueError:
+        return False
+
 # ------------------ OpenAI (optional) ------------------
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
 AI_AVAILABLE = bool(OPENAI_API_KEY)
@@ -1123,6 +1163,11 @@ if "CarfaxLink" in data.columns:
     has_carfax_link = data["CarfaxLink"].astype(str).str.contains(r"^https?://", case=False, regex=True, na=False)
     data["CarfaxUploaded"] = data["CarfaxUploaded"].fillna(False) | has_carfax_link
 
+if "CPO" in data.columns:
+    data["IsCPO"] = data["CPO"].apply(normalize_cpo_flag)
+else:
+    data["IsCPO"] = False
+
 # Derived metrics
 data["AvgServiceInterval"] = data.apply(estimate_service_interval, axis=1)
 data["CarfaxQualityScore"], data["CarfaxQualityLabel"] = zip(*data.apply(carfax_quality_score, axis=1))
@@ -1151,16 +1196,23 @@ score_sort_cols = [
     col for col in ["Score", "CarfaxQualityScore", "SafetyScore", "StoryScore"] if col in data.columns
 ]
 if score_sort_cols:
-    ranking_order = (
-        data.sort_values(score_sort_cols, ascending=[False] * len(score_sort_cols))
-        .reset_index()
-    )
-    ranking = pd.Series(
-        np.arange(1, len(ranking_order) + 1, dtype=int), index=ranking_order["index"]
-    )
-    data["Ranking"] = ranking.reindex(data.index).astype("Int64")
+    sorted_data = data.sort_values(score_sort_cols, ascending=[False] * len(score_sort_cols))
+
+    non_cpo_indices = sorted_data.index[~sorted_data["IsCPO"]]
+    cpo_indices = sorted_data.index[sorted_data["IsCPO"]]
+
+    ranking_series = pd.Series(pd.NA, index=data.index, dtype="Int64")
+    if len(non_cpo_indices):
+        ranking_series.loc[non_cpo_indices] = np.arange(1, len(non_cpo_indices) + 1, dtype=int)
+    data["Ranking"] = ranking_series
+
+    cpo_ranking_series = pd.Series(pd.NA, index=data.index, dtype="Int64")
+    if len(cpo_indices):
+        cpo_ranking_series.loc[cpo_indices] = np.arange(1, len(cpo_indices) + 1, dtype=int)
+    data["CPORanking"] = cpo_ranking_series
 else:
     data["Ranking"] = pd.Series(pd.NA, index=data.index, dtype="Int64")
+    data["CPORanking"] = pd.Series(pd.NA, index=data.index, dtype="Int64")
 
 # Separate pending statuses from active inventory
 if "Status" in data.columns:
@@ -1205,21 +1257,66 @@ with tab_overview:
     )
 
     st.divider()
-    st.subheader("Top 10 Leaderboard")
-    if data.empty:
-        st.info("Upload inventory to see performance leaderboards.")
+    st.subheader("Top 10 Leaderboard (Non-CPO)")
+    if not data.empty and "IsCPO" in data.columns:
+        non_cpo = data[~data["IsCPO"]].copy()
+    else:
+        non_cpo = data.copy()
+    if non_cpo.empty:
+        st.caption("No non-CPO vehicles available for ranking.")
     else:
         top_cols = [
-            "VIN","Year","Make","Model","Trim","Body","Price","Mileage",
+            "Ranking","VIN","Year","Make","Model","Trim","Body","Price","Mileage",
             "Score","SafetyScore","CarfaxQualityScore","ValueCategory"
         ]
-        top_cols = [c for c in top_cols if c in data.columns]
-        top_sort_cols = [c for c in ["Score", "CarfaxQualityScore"] if c in data.columns]
-        if top_sort_cols:
-            top10 = data.sort_values(top_sort_cols, ascending=[False] * len(top_sort_cols)).head(10)
+        top_cols = [c for c in top_cols if c in non_cpo.columns]
+
+        sort_cols = []
+        ascending = []
+        if "Ranking" in non_cpo.columns:
+            sort_cols.append("Ranking")
+            ascending.append(True)
+        for metric in ["Score", "CarfaxQualityScore"]:
+            if metric in non_cpo.columns:
+                sort_cols.append(metric)
+                ascending.append(False)
+
+        if sort_cols:
+            top10 = non_cpo.sort_values(sort_cols, ascending=ascending).head(10)
         else:
-            top10 = data.head(10)
+            top10 = non_cpo.head(10)
         st.dataframe(top10[top_cols], use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Top CPO Leaderboard")
+    if not data.empty and "IsCPO" in data.columns:
+        cpo_only = data[data["IsCPO"]].copy()
+    else:
+        cpo_only = pd.DataFrame(columns=data.columns)
+    if cpo_only.empty:
+        st.caption("No certified pre-owned vehicles currently in inventory.")
+    else:
+        cpo_cols = [
+            "CPORanking","VIN","Year","Make","Model","Trim","Body","Price","Mileage",
+            "Score","SafetyScore","CarfaxQualityScore","ValueCategory"
+        ]
+        cpo_cols = [c for c in cpo_cols if c in cpo_only.columns]
+
+        cpo_sort_cols = []
+        cpo_ascending = []
+        if "CPORanking" in cpo_only.columns:
+            cpo_sort_cols.append("CPORanking")
+            cpo_ascending.append(True)
+        for metric in ["Score", "CarfaxQualityScore"]:
+            if metric in cpo_only.columns:
+                cpo_sort_cols.append(metric)
+                cpo_ascending.append(False)
+
+        if cpo_sort_cols:
+            top_cpo = cpo_only.sort_values(cpo_sort_cols, ascending=cpo_ascending).head(10)
+        else:
+            top_cpo = cpo_only.head(10)
+        st.dataframe(top_cpo[cpo_cols], use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("Best Values Under $15K")
@@ -1335,6 +1432,9 @@ with tab_listings:
 
             display_df["Year"] = display_df["Year"].apply(_fmt_year)
 
+        if "IsCPO" in display_df.columns:
+            display_df["CPO"] = np.where(display_df["IsCPO"], "Yes", "No")
+
         rename_map = {
             "CarfaxUploaded": "Carfax Uploaded",
             "KBBValue": "MSRP / KBB",
@@ -1342,8 +1442,16 @@ with tab_listings:
             "Warranty": "Warr.",
             "ValueCategory": "Value Category",
             "SafetyScore": "Safety Score",
+            "CPORanking": "CPO Ranking",
         }
         display_df = display_df.rename(columns=rename_map)
+
+        if "IsCPO" in display_df.columns:
+            non_cpo_display = display_df[~display_df["IsCPO"]].copy()
+            cpo_display = display_df[display_df["IsCPO"]].copy()
+        else:
+            non_cpo_display = display_df.copy()
+            cpo_display = pd.DataFrame(columns=display_df.columns)
 
         cols = [
             "Carfax Uploaded",
@@ -1365,14 +1473,49 @@ with tab_listings:
             "CarfaxQualityScore",
             "Safety Score",
         ]
-        cols = [c for c in cols if c in display_df.columns]
-        table_height = max(360, int(42 * (len(display_df) + 1)))
-        st.dataframe(
-            display_df[cols],
-            use_container_width=True,
-            hide_index=True,
-            height=table_height,
-        )
+        cols = [c for c in cols if c in non_cpo_display.columns]
+        if non_cpo_display.empty:
+            st.caption("No non-CPO vehicles currently available in active inventory.")
+        else:
+            table_height = max(360, int(42 * (len(non_cpo_display) + 1)))
+            st.dataframe(
+                non_cpo_display[cols],
+                use_container_width=True,
+                hide_index=True,
+                height=table_height,
+            )
+
+        if not cpo_display.empty:
+            st.divider()
+            st.subheader("CPO Listings")
+            cpo_cols = [
+                "Carfax Uploaded",
+                "CPO Ranking",
+                "Year",
+                "Make",
+                "Model",
+                "Trim",
+                "Price",
+                "MSRP / KBB",
+                "Days In Inv",
+                "Mileage",
+                "Drive Train",
+                "Body",
+                "Warr.",
+                "CPO",
+                "Value Category",
+                "CarfaxQualityLabel",
+                "CarfaxQualityScore",
+                "Safety Score",
+            ]
+            cpo_cols = [c for c in cpo_cols if c in cpo_display.columns]
+            cpo_height = max(360, int(42 * (len(cpo_display) + 1)))
+            st.dataframe(
+                cpo_display[cpo_cols],
+                use_container_width=True,
+                hide_index=True,
+                height=cpo_height,
+            )
 
 # ========== Vehicle Finder ==========
 with tab_finder:
