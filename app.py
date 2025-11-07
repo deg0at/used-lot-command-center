@@ -23,6 +23,15 @@ from modules.drive_sync import SyncOutcome, sync_google_drive_folder
 st.set_page_config(page_title="Used Lot Car Finder", layout="wide")
 st.title("🚗 Used Lot Car Finder")
 
+try:
+    APP_SECRETS = dict(st.secrets)
+except FileNotFoundError:
+    logging.warning("Streamlit secrets file not found; continuing with empty secrets.")
+    APP_SECRETS = {}
+except Exception as exc:  # pragma: no cover - defensive
+    logging.error("Unable to load Streamlit secrets: %s", exc)
+    APP_SECRETS = {}
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 CARFAX_DIR = os.path.join(DATA_DIR, "carfaxes")
@@ -42,7 +51,7 @@ for fpath in [CARFAX_CACHE_PATH, STORY_CACHE_PATH, CARFAX_PARSE_INDEX_PATH]:
 
 
 def _resolve_drive_folder_id() -> str:
-    raw = st.secrets.get("google_drive_folder_id", os.getenv("GOOGLE_DRIVE_FOLDER_ID", ""))
+    raw = APP_SECRETS.get("google_drive_folder_id", os.getenv("GOOGLE_DRIVE_FOLDER_ID", ""))
     if isinstance(raw, str):
         return raw.strip()
     if raw is None:
@@ -57,7 +66,7 @@ try:
         listings_dir=LISTINGS_DIR,
         carfax_dir=CARFAX_DIR,
         index_path=DRIVE_SYNC_INDEX_PATH,
-        secrets=st.secrets,
+        secrets=APP_SECRETS,
     )
 except Exception as exc:
     logging.error("Google Drive sync failed: %s", exc)
@@ -149,7 +158,7 @@ def normalize_cpo_flag(value) -> bool:
         return False
 
 # ------------------ OpenAI (optional) ------------------
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+OPENAI_API_KEY = APP_SECRETS.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
 AI_AVAILABLE = bool(OPENAI_API_KEY)
 try:
     import openai
